@@ -1,0 +1,933 @@
+"use client";
+
+import { useCallback, useEffect, useState, useMemo } from "react";
+import Navbar from "@/components/Navbar";
+import ProtectedRoute from "@/components/ProtectedRoute";
+import ImageUpload from "@/components/ImageUpload";
+import TopicSelector from "@/components/PromptSelector";
+import JobCard from "@/components/JobCard";
+import ImageLightbox from "@/components/ImageLightbox";
+import api from "@/lib/api";
+import { useAuth } from "@/lib/auth";
+
+// ── Download helpers (File System Access API with fallback) ──
+
+async function downloadSingleImage(url: string, suggestedName: string) {
+  try {
+    const response = await fetch(url);
+    const blob = await response.blob();
+    if ("showSaveFilePicker" in window) {
+      const ext = suggestedName.split(".").pop() || "png";
+      const mimeMap: Record<string, string> = {
+        png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg",
+        webp: "image/webp", jfif: "image/jpeg",
+      };
+      const handle = await (window as unknown as { showSaveFilePicker: (opts: unknown) => Promise<FileSystemFileHandle> }).showSaveFilePicker({
+        suggestedName,
+        types: [{ description: "Image", accept: { [mimeMap[ext] || "image/png"]: [`.${ext}`] } }],
+      });
+      const writable = await handle.createWritable();
+      await writable.write(blob);
+      await writable.close();
+    } else {
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = suggestedName;
+      a.click();
+      URL.revokeObjectURL(a.href);
+    }
+  } catch (err: unknown) {
+    if ((err as { name?: string }).name !== "AbortError") console.error("Download failed:", err);
+  }
+}
+
+async function downloadBatchToFolder(images: { url: string; name: string }[]) {
+  try {
+    if ("showDirectoryPicker" in window) {
+      const dirHandle = await (window as unknown as { showDirectoryPicker: (opts: unknown) => Promise<FileSystemDirectoryHandle> }).showDirectoryPicker({ mode: "readwrite" });
+      for (const img of images) {
+        const response = await fetch(img.url);
+        const blob = await response.blob();
+        const fileHandle = await dirHandle.getFileHandle(img.name, { create: true });
+        const writable = await fileHandle.createWritable();
+        await writable.write(blob);
+        await writable.close();
+      }
+      alert(`Đã lưu ${images.length} ảnh thành công!`);
+    } else {
+      // Fallback: download each file individually
+      for (const img of images) {
+        const response = await fetch(img.url);
+        const blob = await response.blob();
+        const a = document.createElement("a");
+        a.href = URL.createObjectURL(blob);
+        a.download = img.name;
+        a.click();
+        URL.revokeObjectURL(a.href);
+        await new Promise((r) => setTimeout(r, 300));
+      }
+    }
+  } catch (err: unknown) {
+    if ((err as { name?: string }).name !== "AbortError") console.error("Batch download failed:", err);
+  }
+}
+
+interface Job {
+  id: number;
+  batch_id: string | null;
+  original_image: string;
+  mockup_image: string | null;
+  status: "pending" | "processing" | "done" | "error";
+  error: string | null;
+  created_at: string;
+  username?: string;
+  prompt_name?: string;
+  prompt_mode?: string;
+  group_role?: string;
+}
+
+interface BatchGroup {
+  key: string;
+  original_image: string;
+  created_at: string;
+  jobs: Job[];
+}
+
+export default function DashboardPage() {
+  const { user } = useAuth();
+
+  if (user?.role === "admin") {
+    return <AdminDashboard />;
+  }
+  return <UserDashboard />;
+}
+
+// ── Admin Dashboard ─────────────────────────────────────────
+interface Stats {
+  users: { total: number; mockup: number; trade: number };
+  jobs: { total: number; today: number; pending: number; error: number };
+  accounts: { total: number; free: number; busy: number; disabled: number };
+}
+
+function AdminDashboard() {
+  const [stats, setStats] = useState<Stats | null>(null);
+  const [jobs, setJobs] = useState<Job[]>([]);
+  const [loadingJobs, setLoadingJobs] = useState(true);
+  const [page, setPage] = useState(1);
+  const [totalPages, setTotalPages] = useState(1);
+  const [filterRole, setFilterRole] = useState("");
+  const [filterStatus, setFilterStatus] = useState("");
+  const [showOriginal, setShowOriginal] = useState<string | null>(null);
+  const [expandedBatch, setExpandedBatch] = useState<string | null>(null);
+
+  const fetchStats = useCallback(() => {
+    api.get("/jobs/admin/stats").then((r) => setStats(r.data)).catch(() => {});
+  }, []);
+
+  const fetchJobs = useCallback(() => {
+    const params: Record<string, string | number> = { page, limit: 50 };
+    if (filterRole) params.role = filterRole;
+    if (filterStatus) params.status = filterStatus;
+    api
+      .get("/jobs", { params })
+      .then((res) => {
+        const body = res.data;
+        setJobs(body.data || body);
+        setTotalPages(body.pagination?.totalPages || 1);
+      })
+      .catch(() => {})
+      .finally(() => setLoadingJobs(false));
+  }, [page, filterRole, filterStatus]);
+
+  useEffect(() => {
+    fetchStats();
+    const i = setInterval(fetchStats, 10000);
+    return () => clearInterval(i);
+  }, [fetchStats]);
+
+  useEffect(() => {
+    setLoadingJobs(true);
+    fetchJobs();
+    const i = setInterval(fetchJobs, 5000);
+    return () => clearInterval(i);
+  }, [fetchJobs]);
+
+  // Fast-poll (2s) when any job is active
+  const hasActiveJobs = jobs.some((j) => j.status === "pending" || j.status === "processing");
+  useEffect(() => {
+    if (!hasActiveJobs) return;
+    const fast = setInterval(fetchJobs, 2000);
+    return () => clearInterval(fast);
+  }, [hasActiveJobs, fetchJobs]);
+
+  useEffect(() => { setPage(1); }, [filterRole, filterStatus]);
+
+  const handleRetry = async (jobId: number) => {
+    try { await api.post(`/jobs/${jobId}/retry`); fetchJobs(); fetchStats(); } catch { alert("Retry thất bại."); }
+  };
+
+  // Group jobs by batch_id
+  const batches = useMemo(() => {
+    const map = new Map<string, Job[]>();
+    for (const job of jobs) {
+      const key = job.batch_id || `single_${job.id}`;
+      const arr = map.get(key) || [];
+      arr.push(job);
+      map.set(key, arr);
+    }
+    return Array.from(map.entries()).map(([key, bJobs]) => ({
+      key,
+      original_image: bJobs[0].original_image,
+      username: bJobs[0].username || "—",
+      created_at: bJobs[0].created_at,
+      jobs: bJobs,
+      doneCount: bJobs.filter((j) => j.status === "done").length,
+      errorCount: bJobs.filter((j) => j.status === "error").length,
+    }));
+  }, [jobs]);
+
+  const statusCfg: Record<string, { label: string; cls: string }> = {
+    pending: { label: "Chờ", cls: "bg-slate-100 text-slate-600" },
+    processing: { label: "Đang xử lý", cls: "bg-blue-100 text-blue-600" },
+    done: { label: "Hoàn tất", cls: "bg-green-100 text-green-700" },
+    error: { label: "Lỗi", cls: "bg-red-100 text-red-600" },
+  };
+
+  const getBatchStatus = (b: typeof batches[0]) => {
+    if (b.errorCount > 0) return statusCfg.error;
+    if (b.doneCount === b.jobs.length) return statusCfg.done;
+    if (b.jobs.some((j) => j.status === "processing")) return statusCfg.processing;
+    return statusCfg.pending;
+  };
+
+  return (
+    <ProtectedRoute>
+      <Navbar />
+      <main className="mx-auto w-full max-w-7xl flex-1 px-4 py-6 sm:px-6">
+        {/* Stats cards */}
+        {stats && (
+          <div className="mb-6 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+            <StatCard icon="👥" label="Users" value={stats.users.total} sub={`${stats.users.mockup} mockup · ${stats.users.trade} trade`} color="blue" />
+            <StatCard icon="📋" label="Jobs hôm nay" value={stats.jobs.today} sub={`${stats.jobs.total} tổng`} color="indigo" />
+            <StatCard icon="⏳" label="Đang xử lý" value={stats.jobs.pending} sub={stats.jobs.error > 0 ? `${stats.jobs.error} lỗi` : "Không lỗi"} color={stats.jobs.error > 0 ? "red" : "emerald"} />
+            <StatCard icon="🤖" label="Gemini Accounts" value={`${stats.accounts.free}/${stats.accounts.total}`} sub={`${stats.accounts.busy} busy · ${stats.accounts.disabled} off`} color="amber" />
+          </div>
+        )}
+
+        {/* Filters */}
+        <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+          <h2 className="flex items-center gap-2 text-lg font-semibold text-slate-800">
+            <svg className="h-5 w-5 text-slate-500" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" d="M12 6v6h4.5m4.5 0a9 9 0 11-18 0 9 9 0 0118 0z" />
+            </svg>
+            Tất cả Jobs
+          </h2>
+          <div className="flex items-center gap-2">
+            <select value={filterRole} onChange={(e) => setFilterRole(e.target.value)} className="rounded-lg border border-slate-300 px-3 py-1.5 text-sm text-slate-600">
+              <option value="">Tất cả role</option>
+              <option value="mockup">Mockup</option>
+              <option value="trade">Trade</option>
+            </select>
+            <select value={filterStatus} onChange={(e) => setFilterStatus(e.target.value)} className="rounded-lg border border-slate-300 px-3 py-1.5 text-sm text-slate-600">
+              <option value="">Tất cả trạng thái</option>
+              <option value="pending">Chờ</option>
+              <option value="processing">Đang xử lý</option>
+              <option value="done">Hoàn tất</option>
+              <option value="error">Lỗi</option>
+            </select>
+            <button onClick={() => { fetchJobs(); fetchStats(); }} className="rounded-lg px-3 py-1.5 text-sm text-slate-500 transition hover:bg-slate-100">↻ Refresh</button>
+          </div>
+        </div>
+
+        {/* Batch list */}
+        {loadingJobs ? (
+          <div className="flex justify-center py-12"><div className="h-8 w-8 animate-spin rounded-full border-2 border-blue-600 border-t-transparent" /></div>
+        ) : batches.length === 0 ? (
+          <div className="rounded-xl border-2 border-dashed border-slate-200 py-16 text-center">
+            <p className="text-sm text-slate-400">Không có job nào.</p>
+          </div>
+        ) : (
+          <div className="space-y-3">
+            {batches.map((batch) => {
+              const bStatus = getBatchStatus(batch);
+              const isExpanded = expandedBatch === batch.key;
+              return (
+                <div key={batch.key} className="overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm">
+                  {/* Batch header — clickable */}
+                  <div
+                    className="flex cursor-pointer items-center gap-3 px-4 py-3 transition hover:bg-slate-50"
+                    onClick={() => setExpandedBatch(isExpanded ? null : batch.key)}
+                  >
+                    <img
+                      src={`${API_BASE}/uploads/${batch.original_image}`}
+                      alt=""
+                      className="h-11 w-11 shrink-0 rounded-lg object-cover ring-offset-1 hover:ring-2 hover:ring-blue-400"
+                      onClick={(e) => { e.stopPropagation(); setShowOriginal(`${API_BASE}/uploads/${batch.original_image}`); }}
+                    />
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-center gap-2">
+                        <span className="text-sm font-semibold text-slate-700">{batch.username}</span>
+                        <span className="text-xs text-slate-400">·</span>
+                        <span className="text-xs text-slate-500">{batch.jobs.length} prompt{batch.jobs.length > 1 ? "s" : ""}</span>
+                        <span className={`rounded-full px-2 py-0.5 text-xs font-medium ${bStatus.cls}`}>{bStatus.label}</span>
+                        {batch.doneCount > 0 && batch.doneCount < batch.jobs.length && (
+                          <span className="text-xs text-slate-400">{batch.doneCount}/{batch.jobs.length}</span>
+                        )}
+                        {batch.errorCount > 0 && (
+                          <span className="text-xs text-red-500">{batch.errorCount} lỗi</span>
+                        )}
+                      </div>
+                      <p className="text-xs text-slate-400">{formatTime(batch.created_at)}</p>
+                    </div>
+                    <svg className={`h-5 w-5 shrink-0 text-slate-400 transition-transform ${isExpanded ? "rotate-180" : ""}`} fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor">
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M19.5 8.25l-7.5 7.5-7.5-7.5" />
+                    </svg>
+                  </div>
+
+                  {/* Expanded detail — mockup 4/row, line_drawing 1/row */}
+                  {isExpanded && (
+                    <div className="border-t border-slate-100">
+                      {(() => {
+                        const mockupJobs = batch.jobs.filter((j: Job) => j.prompt_mode !== "line_drawing");
+                        const lineJobs = batch.jobs.filter((j: Job) => j.prompt_mode === "line_drawing");
+                        return (
+                          <>
+                            {mockupJobs.length > 0 && (
+                              <div className="grid gap-px bg-slate-100 sm:grid-cols-2 lg:grid-cols-4">
+                                {mockupJobs.map((job: Job) => {
+                                  const cfg = statusCfg[job.status] || statusCfg.pending;
+                                  return (
+                                    <div key={job.id} className="bg-white p-3">
+                                      <div className="mb-2 flex items-center justify-between">
+                                        <span className="truncate text-xs font-medium text-slate-600" title={job.prompt_name}>{job.prompt_name || `#${job.id}`}</span>
+                                        <span className={`rounded-full px-1.5 py-0.5 text-[10px] font-medium ${cfg.cls}`}>{cfg.label}</span>
+                                      </div>
+                                      {job.mockup_image ? (
+                                        <a href={`${API_BASE}/outputs/${job.mockup_image}`} target="_blank" rel="noopener noreferrer">
+                                          <img src={`${API_BASE}/outputs/${job.mockup_image}`} alt="" className="aspect-square w-full rounded-lg object-cover transition hover:opacity-80" loading="lazy" />
+                                        </a>
+                                      ) : job.status === "processing" ? (
+                                        <div className="flex aspect-square flex-col items-center justify-center gap-2 rounded-lg bg-blue-50/70">
+                                          <div className="h-8 w-8 animate-spin rounded-full border-[2.5px] border-blue-500 border-t-transparent" />
+                                          <span className="text-[11px] font-medium text-blue-500">Đang tạo ảnh...</span>
+                                        </div>
+                                      ) : job.status === "pending" ? (
+                                        <div className="flex aspect-square flex-col items-center justify-center gap-2 rounded-lg bg-slate-50">
+                                          <svg className="h-7 w-7 text-slate-300" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor">
+                                            <path strokeLinecap="round" strokeLinejoin="round" d="M12 6v6h4.5m4.5 0a9 9 0 11-18 0 9 9 0 0118 0z" />
+                                          </svg>
+                                          <span className="text-[11px] font-medium text-slate-400">Đang chờ...</span>
+                                        </div>
+                                      ) : (
+                                        <div className="flex aspect-square items-center justify-center rounded-lg bg-slate-50">
+                                          <span className="text-xs text-slate-300">Chưa có</span>
+                                        </div>
+                                      )}
+                                      {job.status === "error" && (
+                                        <div className="mt-2 flex items-center justify-between">
+                                          <span className="max-w-[120px] truncate text-[10px] text-red-500" title={job.error || ""}>{job.error}</span>
+                                          <button onClick={() => handleRetry(job.id)} className="rounded bg-red-50 px-1.5 py-0.5 text-[10px] font-medium text-red-600 hover:bg-red-100">Thử lại</button>
+                                        </div>
+                                      )}
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                            )}
+                            {lineJobs.length > 0 && (
+                              <div className="grid gap-px bg-slate-100 grid-cols-1">
+                                {lineJobs.map((job: Job) => {
+                                  const cfg = statusCfg[job.status] || statusCfg.pending;
+                                  return (
+                                    <div key={job.id} className="flex items-center gap-4 bg-white p-3">
+                                      <div className="w-48 shrink-0">
+                                        <div className="mb-1 flex items-center justify-between">
+                                          <span className="truncate text-xs font-medium text-slate-600" title={job.prompt_name}>{job.prompt_name || `#${job.id}`}</span>
+                                          <span className={`rounded-full px-1.5 py-0.5 text-[10px] font-medium ${cfg.cls}`}>{cfg.label}</span>
+                                        </div>
+                                        <p className="text-[10px] uppercase tracking-wider text-amber-500 font-medium">Line Drawing</p>
+                                      </div>
+                                      <div className="flex-1 max-w-2xl">
+                                        {job.mockup_image ? (
+                                          <a href={`${API_BASE}/outputs/${job.mockup_image}`} target="_blank" rel="noopener noreferrer">
+                                            <img src={`${API_BASE}/outputs/${job.mockup_image}`} alt="" className="w-full rounded-lg object-contain transition hover:opacity-80" style={{maxHeight: "300px"}} loading="lazy" />
+                                          </a>
+                                        ) : job.status === "processing" ? (
+                                          <div className="flex h-32 flex-col items-center justify-center gap-2 rounded-lg bg-blue-50/70">
+                                            <div className="h-8 w-8 animate-spin rounded-full border-[2.5px] border-blue-500 border-t-transparent" />
+                                            <span className="text-[11px] font-medium text-blue-500">Đang tạo ảnh...</span>
+                                          </div>
+                                        ) : job.status === "pending" ? (
+                                          <div className="flex h-32 flex-col items-center justify-center gap-2 rounded-lg bg-slate-50">
+                                            <svg className="h-7 w-7 text-slate-300" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor">
+                                              <path strokeLinecap="round" strokeLinejoin="round" d="M12 6v6h4.5m4.5 0a9 9 0 11-18 0 9 9 0 0118 0z" />
+                                            </svg>
+                                            <span className="text-[11px] font-medium text-slate-400">Đang chờ...</span>
+                                          </div>
+                                        ) : (
+                                          <div className="flex h-32 items-center justify-center rounded-lg bg-slate-50">
+                                            <span className="text-xs text-slate-300">Chưa có</span>
+                                          </div>
+                                        )}
+                                      </div>
+                                      {job.status === "error" && (
+                                        <div className="flex items-center gap-2">
+                                          <span className="max-w-[120px] truncate text-[10px] text-red-500" title={job.error || ""}>{job.error}</span>
+                                          <button onClick={() => handleRetry(job.id)} className="rounded bg-red-50 px-1.5 py-0.5 text-[10px] font-medium text-red-600 hover:bg-red-100">Thử lại</button>
+                                        </div>
+                                      )}
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                            )}
+                          </>
+                        );
+                      })()}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+        {/* Pagination */}
+        {totalPages > 1 && (
+          <div className="mt-6 flex items-center justify-center gap-2">
+            <button onClick={() => setPage((p) => Math.max(1, p - 1))} disabled={page <= 1} className="rounded-lg border border-slate-300 px-3 py-1.5 text-sm font-medium text-slate-600 transition hover:bg-slate-50 disabled:opacity-40">← Trước</button>
+            <span className="px-3 text-sm text-slate-500">Trang {page} / {totalPages}</span>
+            <button onClick={() => setPage((p) => Math.min(totalPages, p + 1))} disabled={page >= totalPages} className="rounded-lg border border-slate-300 px-3 py-1.5 text-sm font-medium text-slate-600 transition hover:bg-slate-50 disabled:opacity-40">Sau →</button>
+          </div>
+        )}
+
+        {showOriginal && (
+          <ImageLightbox src={showOriginal} name="" onClose={() => setShowOriginal(null)} showDownload={false} />
+        )}
+      </main>
+    </ProtectedRoute>
+  );
+}
+
+function StatCard({ icon, label, value, sub, color }: { icon: string; label: string; value: string | number; sub: string; color: string }) {
+  const colorMap: Record<string, string> = {
+    blue: "from-blue-50 to-white border-blue-100",
+    indigo: "from-indigo-50 to-white border-indigo-100",
+    emerald: "from-emerald-50 to-white border-emerald-100",
+    red: "from-red-50 to-white border-red-100",
+    amber: "from-amber-50 to-white border-amber-100",
+  };
+  return (
+    <div className={`rounded-xl border bg-gradient-to-br p-4 ${colorMap[color] || colorMap.blue}`}>
+      <div className="mb-1 flex items-center gap-2">
+        <span className="text-lg">{icon}</span>
+        <span className="text-sm font-medium text-slate-500">{label}</span>
+      </div>
+      <p className="text-2xl font-bold text-slate-800">{value}</p>
+      <p className="mt-0.5 text-xs text-slate-400">{sub}</p>
+    </div>
+  );
+}
+
+// ── User Dashboard (mockup / trade) ────────────────────────
+function UserDashboard() {
+  const { user } = useAuth();
+  const [file, setFile] = useState<File | null>(null);
+  const [preview, setPreview] = useState<string | null>(null);
+  const [groupId, setGroupId] = useState<number | null>(null);
+  const [uploading, setUploading] = useState(false);
+  const [jobs, setJobs] = useState<Job[]>([]);
+  const [loadingJobs, setLoadingJobs] = useState(true);
+  const [page, setPage] = useState(1);
+  const [totalPages, setTotalPages] = useState(1);
+
+  const fetchJobs = useCallback(() => {
+    api
+      .get("/jobs", { params: { page, limit: 5 } })
+      .then((res) => {
+        const body = res.data;
+        if (body.data) {
+          setJobs(body.data);
+          setTotalPages(body.pagination?.totalPages || 1);
+        } else {
+          setJobs(body);
+        }
+      })
+      .catch(() => {})
+      .finally(() => setLoadingJobs(false));
+  }, [page]);
+
+  useEffect(() => {
+    setLoadingJobs(true);
+    fetchJobs();
+    const interval = setInterval(fetchJobs, 5000);
+    return () => clearInterval(interval);
+  }, [fetchJobs]);
+
+  // Fast-poll (2s) when any job is active, so done images appear instantly
+  const hasActiveJobs = jobs.some((j) => j.status === "pending" || j.status === "processing");
+  useEffect(() => {
+    if (!hasActiveJobs) return;
+    const fast = setInterval(fetchJobs, 2000);
+    return () => clearInterval(fast);
+  }, [hasActiveJobs, fetchJobs]);
+
+  // Group jobs by batch_id (or individual jobs without batch)
+  const batches = useMemo<BatchGroup[]>(() => {
+    const map = new Map<string, Job[]>();
+    for (const job of jobs) {
+      const key = job.batch_id || `single_${job.id}`;
+      const group = map.get(key) || [];
+      group.push(job);
+      map.set(key, group);
+    }
+    return Array.from(map.entries()).map(([key, groupJobs]) => ({
+      key,
+      original_image: groupJobs[0].original_image,
+      created_at: groupJobs[0].created_at,
+      jobs: groupJobs,
+    }));
+  }, [jobs]);
+
+  const handleFileSelect = (f: File) => {
+    setFile(f);
+    setPreview(URL.createObjectURL(f));
+  };
+
+  const handleClear = () => {
+    setFile(null);
+    setPreview(null);
+  };
+
+  const handleSubmit = async () => {
+    if (!file || !groupId) return;
+    setUploading(true);
+    try {
+      const formData = new FormData();
+      formData.append("image", file);
+      formData.append("group_id", String(groupId));
+      await api.post("/jobs", formData, {
+        headers: { "Content-Type": "multipart/form-data" },
+      });
+      handleClear();
+      setGroupId(null);
+      fetchJobs();
+    } catch (err: unknown) {
+      const msg = (err as { response?: { data?: { error?: string } } })?.response?.data?.error || "Lỗi không xác định";
+      alert(`Tạo job thất bại: ${msg}`);
+    } finally {
+      setUploading(false);
+    }
+  };
+
+  const handleRetry = async (jobId: number) => {
+    try {
+      await api.post(`/jobs/${jobId}/retry`);
+      fetchJobs();
+    } catch {
+      alert("Retry thất bại.");
+    }
+  };
+
+  const pendingCount = jobs.filter(
+    (j) => j.status === "pending" || j.status === "processing"
+  ).length;
+
+  return (
+    <ProtectedRoute>
+      <Navbar />
+      <main className="mx-auto w-full max-w-7xl flex-1 px-4 py-6 sm:px-6">
+        {/* Upload section */}
+        <div className="mb-8 rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
+          <h2 className="mb-4 flex items-center gap-2 text-lg font-semibold text-slate-800">
+            <svg className="h-5 w-5 text-blue-600" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" d="M12 4.5v15m7.5-7.5h-15" />
+            </svg>
+            Tạo Job mới
+          </h2>
+          <div className="grid gap-4 md:grid-cols-2">
+            <div>
+              <label className="mb-1.5 block text-sm font-medium text-slate-600">
+                Ảnh gốc
+              </label>
+              <ImageUpload
+                onFileSelect={handleFileSelect}
+                preview={preview}
+                onClear={handleClear}
+              />
+            </div>
+            <div className="flex flex-col">
+              <div>
+                <label className="mb-1.5 block text-sm font-medium text-slate-600">
+                  Chọn Chủ đề
+                </label>
+                <TopicSelector value={groupId} onChange={setGroupId} />
+              </div>
+              <button
+                onClick={handleSubmit}
+                disabled={!file || !groupId || uploading}
+                className="mt-4 flex w-full items-center justify-center gap-2 rounded-lg bg-blue-600 py-2.5 text-sm font-semibold text-white shadow-sm transition-colors hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                {uploading ? (
+                  <>
+                    <div className="h-4 w-4 animate-spin rounded-full border-2 border-white border-t-transparent" />
+                    Đang tải lên...
+                  </>
+                ) : (
+                  <>
+                    <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor">
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5m-13.5-9L12 3m0 0l4.5 4.5M12 3v13.5" />
+                    </svg>
+                    Upload &amp; {user?.role === "trade" ? "Tạo Trade" : "Tạo Mockup"}
+                  </>
+                )}
+              </button>
+            </div>
+          </div>
+        </div>
+
+        {/* Jobs history */}
+        <div>
+          <div className="mb-4 flex items-center justify-between">
+            <h2 className="flex items-center gap-2 text-lg font-semibold text-slate-800">
+              <svg className="h-5 w-5 text-slate-500" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" d="M12 6v6h4.5m4.5 0a9 9 0 11-18 0 9 9 0 0118 0z" />
+              </svg>
+              Lịch sử Jobs
+              {pendingCount > 0 && (
+                <span className="rounded-full bg-blue-100 px-2 py-0.5 text-xs font-medium text-blue-700">
+                  {pendingCount} đang xử lý
+                </span>
+              )}
+            </h2>
+            <button
+              onClick={fetchJobs}
+              className="rounded-lg px-3 py-1.5 text-sm text-slate-500 transition hover:bg-slate-100"
+            >
+              ↻ Refresh
+            </button>
+          </div>
+
+          {loadingJobs ? (
+            <div className="flex justify-center py-12">
+              <div className="h-8 w-8 animate-spin rounded-full border-2 border-blue-600 border-t-transparent" />
+            </div>
+          ) : batches.length === 0 ? (
+            <div className="rounded-xl border-2 border-dashed border-slate-200 py-16 text-center">
+              <svg className="mx-auto mb-3 h-10 w-10 text-slate-300" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" d="M2.25 15.75l5.159-5.159a2.25 2.25 0 013.182 0l5.159 5.159m-1.5-1.5l1.409-1.409a2.25 2.25 0 013.182 0l2.909 2.909M3.75 21h16.5a1.5 1.5 0 001.5-1.5V6a1.5 1.5 0 00-1.5-1.5H3.75A1.5 1.5 0 002.25 6v13.5A1.5 1.5 0 003.75 21z" />
+              </svg>
+              <p className="text-sm text-slate-400">Chưa có job nào. Upload ảnh để bắt đầu!</p>
+            </div>
+          ) : (
+            <div className="space-y-6">
+              {batches.map((batch) => (
+                <BatchCard
+                  key={batch.key}
+                  batch={batch}
+                  onRetry={handleRetry}
+                />
+              ))}
+            </div>
+          )}
+
+          {/* Pagination */}
+          {totalPages > 1 && (
+            <div className="mt-6 flex items-center justify-center gap-2">
+              <button
+                onClick={() => setPage((p) => Math.max(1, p - 1))}
+                disabled={page <= 1}
+                className="rounded-lg border border-slate-300 px-3 py-1.5 text-sm font-medium text-slate-600 transition hover:bg-slate-50 disabled:opacity-40"
+              >
+                ← Trước
+              </button>
+              <span className="px-3 text-sm text-slate-500">
+                Trang {page} / {totalPages}
+              </span>
+              <button
+                onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+                disabled={page >= totalPages}
+                className="rounded-lg border border-slate-300 px-3 py-1.5 text-sm font-medium text-slate-600 transition hover:bg-slate-50 disabled:opacity-40"
+              >
+                Sau →
+              </button>
+            </div>
+          )}
+        </div>
+      </main>
+    </ProtectedRoute>
+  );
+}
+
+const API_BASE = "";
+
+// SQLite stores datetime('now') as UTC without 'Z' suffix.
+// Append 'Z' so JS Date correctly interprets as UTC → converts to local timezone.
+function formatTime(utcStr: string) {
+  const d = new Date(utcStr.endsWith("Z") ? utcStr : utcStr + "Z");
+  return d.toLocaleString("vi-VN", { hour12: false });
+}
+
+function BatchCard({
+  batch,
+  onRetry,
+}: {
+  batch: BatchGroup;
+  onRetry: (id: number) => void;
+}) {
+  const isBatch = batch.jobs.length > 1;
+  const doneCount = batch.jobs.filter((j) => j.status === "done").length;
+  const errorCount = batch.jobs.filter((j) => j.status === "error").length;
+  const allDone = doneCount === batch.jobs.length;
+  const doneJobs = batch.jobs.filter((j) => j.status === "done" && j.mockup_image);
+  const [showOriginal, setShowOriginal] = useState(false);
+
+  const handleDownloadAll = () => {
+    const images = doneJobs.map((j) => {
+      const ext = j.mockup_image!.split(".").pop() || "png";
+      const safeName = (j.prompt_name || `job_${j.id}`).replace(/[<>:"/\\|?*]/g, "_");
+      return {
+        url: `${API_BASE}/outputs/${j.mockup_image}`,
+        name: `${safeName}.${ext}`,
+      };
+    });
+    downloadBatchToFolder(images);
+  };
+
+  // Single job → use compact JobCard
+  if (!isBatch) {
+    return <JobCard job={batch.jobs[0]} onRetry={onRetry} />;
+  }
+
+  // Batch → grouped display
+  return (
+    <div className="overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm">
+      {/* Batch header */}
+      <div className="flex items-center gap-3 border-b border-slate-100 bg-slate-50 px-4 py-3">
+        <img
+          src={`${API_BASE}/uploads/${batch.original_image}`}
+          alt=""
+          className="h-12 w-12 shrink-0 cursor-pointer rounded-lg object-cover ring-offset-1 transition hover:ring-2 hover:ring-blue-400"
+          onClick={() => setShowOriginal(true)}
+          title="Xem ảnh gốc"
+        />
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-2">
+            <span className="text-sm font-semibold text-slate-700">
+              {batch.jobs.length} prompts
+            </span>
+            {allDone ? (
+              <span className="rounded-full bg-green-100 px-2 py-0.5 text-xs font-medium text-green-700">
+                Hoàn tất
+              </span>
+            ) : (
+              <span className="rounded-full bg-blue-100 px-2 py-0.5 text-xs font-medium text-blue-700">
+                {doneCount}/{batch.jobs.length} xong
+                {errorCount > 0 && ` • ${errorCount} lỗi`}
+              </span>
+            )}
+          </div>
+          <p className="text-xs text-slate-400">
+            {formatTime(batch.created_at)}
+          </p>
+        </div>
+        {doneJobs.length > 0 && (
+          <button
+            onClick={handleDownloadAll}
+            className="flex items-center gap-1.5 rounded-lg bg-blue-600 px-3 py-1.5 text-xs font-medium text-white shadow-sm transition hover:bg-blue-700"
+            title="Tải tất cả ảnh đã hoàn tất"
+          >
+            <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5M16.5 12L12 16.5m0 0L7.5 12m4.5 4.5V3" />
+            </svg>
+            Tải tất cả ({doneJobs.length})
+          </button>
+        )}
+      </div>
+
+      {/* Jobs grid inside batch — mockup 4/row, line_drawing 1/row */}
+      {(() => {
+        const mockupJobs = batch.jobs.filter((j) => j.prompt_mode !== "line_drawing");
+        const lineJobs = batch.jobs.filter((j) => j.prompt_mode === "line_drawing");
+        return (
+          <>
+            {mockupJobs.length > 0 && (
+              <div className="grid gap-px bg-slate-100 sm:grid-cols-2 lg:grid-cols-4">
+                {mockupJobs.map((job) => (
+                  <BatchJobItem key={job.id} job={job} onRetry={onRetry} />
+                ))}
+              </div>
+            )}
+            {lineJobs.length > 0 && (
+              <div className="grid gap-px bg-slate-100 grid-cols-1">
+                {lineJobs.map((job) => (
+                  <BatchJobItemWide key={job.id} job={job} onRetry={onRetry} />
+                ))}
+              </div>
+            )}
+          </>
+        );
+      })()}
+
+      {showOriginal && (
+        <ImageLightbox
+          src={`${API_BASE}/uploads/${batch.original_image}`}
+          name={batch.original_image}
+          onClose={() => setShowOriginal(false)}
+          showDownload={false}
+        />
+      )}
+    </div>
+  );
+}
+
+const statusConfig: Record<string, { label: string; color: string; bg: string }> = {
+  pending: { label: "Chờ", color: "text-slate-600", bg: "bg-slate-100" },
+  processing: { label: "Xử lý", color: "text-blue-600", bg: "bg-blue-100" },
+  done: { label: "Xong", color: "text-green-600", bg: "bg-green-100" },
+  error: { label: "Lỗi", color: "text-red-600", bg: "bg-red-100" },
+};
+
+function BatchJobItem({ job, onRetry }: { job: Job; onRetry: (id: number) => void }) {
+  const cfg = statusConfig[job.status] || statusConfig.pending;
+  return (
+    <div className="bg-white p-3">
+      {/* Prompt name + status */}
+      <div className="mb-2 flex items-center justify-between">
+        <span className="truncate text-xs font-medium text-slate-600" title={job.prompt_name}>
+          {job.prompt_name || `Prompt #${job.id}`}
+        </span>
+        <div className="flex items-center gap-1">
+          <span className={`rounded-full px-1.5 py-0.5 text-[10px] font-medium ${cfg.bg} ${cfg.color}`}>
+            {cfg.label}
+          </span>
+          {job.status === "processing" && (
+            <div className="h-3 w-3 animate-spin rounded-full border-[1.5px] border-blue-600 border-t-transparent" />
+          )}
+        </div>
+      </div>
+      {/* Image */}
+      <div>
+        {job.mockup_image ? (
+          <div className="relative">
+            <a href={`${API_BASE}/outputs/${job.mockup_image}`} target="_blank" rel="noopener noreferrer">
+              <img src={`${API_BASE}/outputs/${job.mockup_image}`} alt="" className="aspect-square w-full rounded object-cover hover:opacity-80" loading="lazy" />
+            </a>
+            <button
+              onClick={() => {
+                const ext = job.mockup_image!.split(".").pop() || "png";
+                const safeName = (job.prompt_name || `job_${job.id}`).replace(/[<>:"/\\|?*]/g, "_");
+                downloadSingleImage(`${API_BASE}/outputs/${job.mockup_image}`, `${safeName}.${ext}`);
+              }}
+              className="absolute bottom-1 right-1 flex h-6 w-6 items-center justify-center rounded-full bg-white/90 shadow transition hover:bg-white"
+              title="Tải xuống"
+            >
+              <svg className="h-3.5 w-3.5 text-slate-600" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5M16.5 12L12 16.5m0 0L7.5 12m4.5 4.5V3" />
+              </svg>
+            </button>
+          </div>
+        ) : job.status === "processing" ? (
+          <div className="flex aspect-square flex-col items-center justify-center gap-2 rounded bg-blue-50/70">
+            <div className="h-8 w-8 animate-spin rounded-full border-[2.5px] border-blue-500 border-t-transparent" />
+            <span className="text-[11px] font-medium text-blue-500">Đang tạo ảnh...</span>
+          </div>
+        ) : job.status === "pending" ? (
+          <div className="flex aspect-square flex-col items-center justify-center gap-2 rounded bg-slate-50">
+            <svg className="h-7 w-7 text-slate-300" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" d="M12 6v6h4.5m4.5 0a9 9 0 11-18 0 9 9 0 0118 0z" />
+            </svg>
+            <span className="text-[11px] font-medium text-slate-400">Đang chờ...</span>
+          </div>
+        ) : (
+          <div className="flex aspect-square items-center justify-center rounded bg-slate-50">
+            <svg className="h-5 w-5 text-slate-200" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" d="M2.25 15.75l5.159-5.159a2.25 2.25 0 013.182 0l5.159 5.159m-1.5-1.5l1.409-1.409a2.25 2.25 0 013.182 0l2.909 2.909M3.75 21h16.5a1.5 1.5 0 001.5-1.5V6a1.5 1.5 0 00-1.5-1.5H3.75A1.5 1.5 0 002.25 6v13.5A1.5 1.5 0 003.75 21z" />
+            </svg>
+          </div>
+        )}
+      </div>
+      {/* Error + retry */}
+      {job.status === "error" && (
+        <div className="mt-2 flex items-center justify-between">
+          <span className="max-w-[120px] truncate text-[10px] text-red-500" title={job.error || ""}>
+            {job.error}
+          </span>
+          <button
+            onClick={() => onRetry(job.id)}
+            className="rounded bg-red-50 px-1.5 py-0.5 text-[10px] font-medium text-red-600 hover:bg-red-100"
+          >
+            Thử lại
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function BatchJobItemWide({ job, onRetry }: { job: Job; onRetry: (id: number) => void }) {
+  const cfg = statusConfig[job.status] || statusConfig.pending;
+  return (
+    <div className="flex items-center gap-4 bg-white p-4">
+      {/* Info */}
+      <div className="w-44 shrink-0">
+        <div className="flex items-center gap-2">
+          <span className="truncate text-sm font-medium text-slate-700" title={job.prompt_name}>
+            {job.prompt_name || `Prompt #${job.id}`}
+          </span>
+          <span className={`shrink-0 rounded-full px-1.5 py-0.5 text-[10px] font-medium ${cfg.bg} ${cfg.color}`}>
+            {cfg.label}
+          </span>
+        </div>
+        <p className="mt-0.5 text-[10px] font-medium uppercase tracking-wider text-amber-500">Line Drawing</p>
+        {job.status === "error" && (
+          <div className="mt-2">
+            <span className="block truncate text-[10px] text-red-500" title={job.error || ""}>{job.error}</span>
+            <button onClick={() => onRetry(job.id)} className="mt-1 rounded bg-red-50 px-2 py-0.5 text-[10px] font-medium text-red-600 hover:bg-red-100">Thử lại</button>
+          </div>
+        )}
+      </div>
+      {/* Image — landscape, larger */}
+      <div className="flex-1">
+        {job.mockup_image ? (
+          <div className="relative inline-block">
+            <a href={`${API_BASE}/outputs/${job.mockup_image}`} target="_blank" rel="noopener noreferrer">
+              <img src={`${API_BASE}/outputs/${job.mockup_image}`} alt="" className="max-h-64 rounded-lg object-contain hover:opacity-80" loading="lazy" />
+            </a>
+            <button
+              onClick={() => {
+                const ext = job.mockup_image!.split(".").pop() || "png";
+                const safeName = (job.prompt_name || `job_${job.id}`).replace(/[<>:"/\\|?*]/g, "_");
+                downloadSingleImage(`${API_BASE}/outputs/${job.mockup_image}`, `${safeName}.${ext}`);
+              }}
+              className="absolute bottom-1 right-1 flex h-6 w-6 items-center justify-center rounded-full bg-white/90 shadow transition hover:bg-white"
+              title="Tải xuống"
+            >
+              <svg className="h-3.5 w-3.5 text-slate-600" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5M16.5 12L12 16.5m0 0L7.5 12m4.5 4.5V3" />
+              </svg>
+            </button>
+          </div>
+        ) : job.status === "processing" ? (
+          <div className="flex h-32 flex-col items-center justify-center gap-2 rounded-lg bg-blue-50/70">
+            <div className="h-8 w-8 animate-spin rounded-full border-[2.5px] border-blue-500 border-t-transparent" />
+            <span className="text-[11px] font-medium text-blue-500">Đang tạo ảnh...</span>
+          </div>
+        ) : job.status === "pending" ? (
+          <div className="flex h-32 flex-col items-center justify-center gap-2 rounded-lg bg-slate-50">
+            <svg className="h-7 w-7 text-slate-300" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" d="M12 6v6h4.5m4.5 0a9 9 0 11-18 0 9 9 0 0118 0z" />
+            </svg>
+            <span className="text-[11px] font-medium text-slate-400">Đang chờ...</span>
+          </div>
+        ) : (
+          <div className="flex h-32 items-center justify-center rounded-lg bg-slate-50">
+            <svg className="h-5 w-5 text-slate-200" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" d="M2.25 15.75l5.159-5.159a2.25 2.25 0 013.182 0l5.159 5.159m-1.5-1.5l1.409-1.409a2.25 2.25 0 013.182 0l2.909 2.909M3.75 21h16.5a1.5 1.5 0 001.5-1.5V6a1.5 1.5 0 00-1.5-1.5H3.75A1.5 1.5 0 002.25 6v13.5A1.5 1.5 0 003.75 21z" />
+            </svg>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}

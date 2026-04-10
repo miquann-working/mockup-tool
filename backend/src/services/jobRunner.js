@@ -1,0 +1,671 @@
+const { spawn } = require("child_process");
+const path = require("path");
+const db = require("../db");
+
+const PYTHON = process.env.PYTHON_BIN || "python";
+const SCRIPT = path.resolve(__dirname, "../../../automation/gemini_worker.py");
+const COOLDOWN_MS = 2_000; // 2s cooldown after each batch finishes
+const RETRY_DELAY_SEC = 8; // seconds delay before retrying entire batch
+const MAX_RETRIES = 5; // single-job retry limit only
+const MAX_BATCH_RETRIES = 3; // max times to retry entire batch before giving up
+const RETRY_DELAYS = [5, 10, 7, 8, 5]; // single-job retry delays
+const BATCH_TIMEOUT_MS = 15 * 60 * 1000; // 15 min timeout for entire batch Python process
+
+// Track how many pending retries exist per batch so we don't release account too early
+// Map<batchKey, number>
+const pendingRetries = new Map();
+
+// ── Helpers ─────────────────────────────────────────────────
+
+function pickAccount() {
+  return db
+    .prepare(
+      `SELECT * FROM gemini_accounts
+       WHERE status = 'free'
+         AND (rate_limited_until IS NULL OR rate_limited_until < datetime('now'))
+       ORDER BY last_used_at ASC LIMIT 1`
+    )
+    .get();
+}
+
+function setAccountStatus(accountId, status) {
+  db.prepare(
+    "UPDATE gemini_accounts SET status = ?, last_used_at = datetime('now') WHERE id = ?"
+  ).run(status, accountId);
+}
+
+function scheduleCooldown(accountId) {
+  setAccountStatus(accountId, "cooldown");
+  setTimeout(() => {
+    setAccountStatus(accountId, "free");
+    // After freeing, check if any batches are waiting for an account
+    scheduleWaiting();
+  }, COOLDOWN_MS);
+}
+
+function markAccountRateLimited(accountId) {
+  // Mark account as rate-limited for 24 hours
+  db.prepare(
+    "UPDATE gemini_accounts SET rate_limited_until = datetime('now', '+24 hours'), status = 'free', last_used_at = datetime('now') WHERE id = ?"
+  ).run(accountId);
+  const account = db.prepare("SELECT email FROM gemini_accounts WHERE id = ?").get(accountId);
+  console.log(`[RateLimit] Account #${accountId} (${account?.email}) rate-limited until +24h`);
+}
+
+function updateJob(jobId, fields) {
+  const sets = Object.keys(fields)
+    .map((k) => `${k} = ?`)
+    .join(", ");
+  const values = Object.values(fields);
+  db.prepare(`UPDATE jobs SET ${sets}, updated_at = datetime('now') WHERE id = ?`).run(
+    ...values,
+    jobId
+  );
+}
+
+function runAutomation({ cookieDir, imagePath, promptText, outputPrefix, imageStyle, skipImageTool }) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const child = spawn(PYTHON, [SCRIPT], {
+      env: {
+        ...process.env,
+        COOKIE_DIR: cookieDir,
+        IMAGE_PATH: imagePath,
+        PROMPT_TEXT: promptText,
+        OUTPUT_PREFIX: outputPrefix,
+        IMAGE_STYLE: imageStyle || "",
+        SKIP_IMAGE_TOOL: skipImageTool ? "1" : "",
+      },
+      cwd: path.resolve(__dirname, "../../../"),
+    });
+
+    // Kill Python process if it exceeds timeout
+    const timer = setTimeout(() => {
+      if (!settled) {
+        settled = true;
+        console.error(`[runAutomation] Timeout after ${BATCH_TIMEOUT_MS / 1000}s — killing Python process`);
+        child.kill("SIGKILL");
+        reject(new Error(`Automation timed out after ${BATCH_TIMEOUT_MS / 1000}s`));
+      }
+    }, BATCH_TIMEOUT_MS);
+
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (d) => (stdout += d));
+    child.stderr.on("data", (d) => {
+      stderr += d;
+      process.stderr.write(d);
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      if (settled) return;
+      settled = true;
+      if (code === 2) {
+        const err = new Error("RATE_LIMITED");
+        err.rateLimited = true;
+        return reject(err);
+      }
+      if (code !== 0) {
+        return reject(new Error(`Automation exited ${code}: ${stderr}`));
+      }
+      const outputFile = stdout.trim();
+      if (!outputFile) {
+        return reject(new Error("Automation returned empty output"));
+      }
+      resolve(outputFile);
+    });
+  });
+}
+
+function runBatchAutomation({ cookieDir, imagePath, imageStyle, skipImageTool, jobsJson, onLine }) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const child = spawn(PYTHON, [SCRIPT], {
+      env: {
+        ...process.env,
+        COOKIE_DIR: cookieDir,
+        IMAGE_PATH: imagePath,
+        IMAGE_STYLE: imageStyle || "",
+        SKIP_IMAGE_TOOL: skipImageTool ? "1" : "",
+        JOBS_JSON: jobsJson,
+      },
+      cwd: path.resolve(__dirname, "../../../"),
+    });
+
+    // Kill Python process if it exceeds timeout
+    const timer = setTimeout(() => {
+      if (!settled) {
+        settled = true;
+        console.error(`[runBatchAutomation] Timeout after ${BATCH_TIMEOUT_MS / 1000}s — killing Python process`);
+        child.kill("SIGKILL");
+        reject(new Error(`Batch automation timed out after ${BATCH_TIMEOUT_MS / 1000}s`));
+      }
+    }, BATCH_TIMEOUT_MS);
+
+    let stdoutBuf = "";
+    let stderr = "";
+    child.stdout.on("data", (d) => {
+      stdoutBuf += d;
+      // Process complete lines in real-time
+      const lines = stdoutBuf.split("\n");
+      stdoutBuf = lines.pop(); // keep incomplete last line in buffer
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (trimmed && onLine) onLine(trimmed);
+      }
+    });
+    child.stderr.on("data", (d) => {
+      stderr += d;
+      process.stderr.write(d);
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      if (settled) return;
+      settled = true;
+      // Process any remaining buffered output
+      if (stdoutBuf.trim() && onLine) onLine(stdoutBuf.trim());
+      if (code === 2) {
+        // Exit code 2 = rate limited
+        const err = new Error("RATE_LIMITED");
+        err.rateLimited = true;
+        return reject(err);
+      }
+      if (code !== 0) {
+        return reject(new Error(`Batch automation exited ${code}: ${stderr.slice(-500)}`));
+      }
+      resolve();
+    });
+  });
+}
+
+// ── Parallel batch runner ───────────────────────────────────
+// Each batch (same batch_id) runs on ONE account, jobs sequential within batch.
+// Different batches run in PARALLEL on different accounts.
+
+// Map<batchKey, { accountId, jobs: number[], processing: boolean, minJobId: number }>
+const batches = new Map();
+// Batch keys waiting for a free account — sorted by priority (oldest batch first)
+const waitingBatches = [];
+
+function getBatchKey(jobId) {
+  const job = db.prepare("SELECT batch_id FROM jobs WHERE id = ?").get(jobId);
+  return job?.batch_id || `single_${jobId}`;
+}
+
+// Debounce timers for batch start — allows all jobs to be enqueued before processing
+const batchStartTimers = new Map();
+
+function enqueueJob(jobId) {
+  const batchKey = getBatchKey(jobId);
+
+  if (!batches.has(batchKey)) {
+    batches.set(batchKey, { accountId: null, jobs: [], processing: false, minJobId: jobId });
+  }
+  const batch = batches.get(batchKey);
+  batch.jobs.push(jobId);
+  if (jobId < batch.minJobId) batch.minJobId = jobId;
+
+  // For multi-job batches, debounce startBatch so all jobs arrive first
+  if (!batchKey.startsWith("single_")) {
+    if (batchStartTimers.has(batchKey)) {
+      clearTimeout(batchStartTimers.get(batchKey));
+    }
+    batchStartTimers.set(batchKey, setTimeout(() => {
+      batchStartTimers.delete(batchKey);
+      startBatch(batchKey);
+    }, 500));
+  } else {
+    startBatch(batchKey);
+  }
+}
+
+/**
+ * Try to start processing a batch. If it has no account yet, pick one.
+ * If no account available, queue for later.
+ */
+function startBatch(batchKey) {
+  const batch = batches.get(batchKey);
+  if (!batch || batch.processing) return;
+  if (batch.jobs.length === 0) {
+    // Check if there are pending retries that will add jobs back
+    const retryCount = pendingRetries.get(batchKey) || 0;
+    if (retryCount > 0) {
+      // Don't release account yet — retries will add jobs back
+      return;
+    }
+    // Batch done — release account
+    if (batch.accountId) {
+      console.log(`[Batch ${batchKey}] All jobs done, releasing account #${batch.accountId}`);
+      scheduleCooldown(batch.accountId);
+    }
+    batches.delete(batchKey);
+    pendingRetries.delete(batchKey);
+    return;
+  }
+
+  // Assign account if not yet assigned
+  if (!batch.accountId) {
+    const account = pickAccount();
+    if (!account) {
+      // No free account — queue this batch for later (oldest first)
+      if (!waitingBatches.includes(batchKey)) {
+        waitingBatches.push(batchKey);
+        // Sort by minJobId so oldest batches get accounts first
+        waitingBatches.sort((a, b) => {
+          const batchA = batches.get(a);
+          const batchB = batches.get(b);
+          return (batchA?.minJobId || Infinity) - (batchB?.minJobId || Infinity);
+        });
+        console.log(`[Batch ${batchKey}] No free account, queued (${waitingBatches.length} waiting)`);
+      }
+      return;
+    }
+    batch.accountId = account.id;
+    setAccountStatus(account.id, "busy");
+    console.log(`[Batch ${batchKey}] Assigned account ${account.email} (#${account.id})`);
+  }
+
+  // Process jobs
+  batch.processing = true;
+
+  // Multi-job batch: process ALL jobs in one Gemini conversation
+  if (!batchKey.startsWith("single_")) {
+    const allJobIds = [...batch.jobs];
+    batch.jobs = [];
+    processBatchJobs(allJobIds, batch.accountId, batchKey)
+      .finally(() => {
+        batch.processing = false;
+        setTimeout(() => startBatch(batchKey), 200);
+      });
+    return;
+  }
+
+  // Single job: existing one-by-one behavior
+  const jobId = batch.jobs.shift();
+  processJob(jobId, batch.accountId)
+    .then(() => {
+      batch.processing = false;
+      setTimeout(() => startBatch(batchKey), 200);
+    })
+    .catch((err) => {
+      console.error(`[Batch ${batchKey}] Unhandled error on job ${jobId}:`, err.message);
+      batch.processing = false;
+      // If no more jobs left in this batch after error, check retries before releasing
+      if (batch.jobs.length === 0 && (pendingRetries.get(batchKey) || 0) === 0) {
+        if (batch.accountId) {
+          console.log(`[Batch ${batchKey}] All jobs done (with errors), releasing account #${batch.accountId}`);
+          scheduleCooldown(batch.accountId);
+        }
+        batches.delete(batchKey);
+        pendingRetries.delete(batchKey);
+      } else {
+        setTimeout(() => startBatch(batchKey), 200);
+      }
+    });
+}
+
+/**
+ * Called when an account becomes free — try to start waiting batches.
+ */
+function scheduleWaiting() {
+  while (waitingBatches.length > 0) {
+    const account = pickAccount();
+    if (!account) break; // no more free accounts
+    const batchKey = waitingBatches.shift();
+    if (batches.has(batchKey)) {
+      startBatch(batchKey);
+    }
+  }
+}
+
+/**
+ * Process all jobs in a batch as a single Gemini conversation.
+ * On any failure, retry the ENTIRE batch (new conversation).
+ */
+async function processBatchJobs(jobIds, accountId, batchKey) {
+  // Load all jobs and validate
+  const jobDataList = [];
+  for (const jobId of jobIds) {
+    const job = db.prepare("SELECT * FROM jobs WHERE id = ?").get(jobId);
+    if (!job) continue;
+
+    const prompt = db.prepare("SELECT * FROM prompts WHERE id = ?").get(job.prompt_id);
+    if (!prompt) {
+      console.error(`[Batch ${batchKey}] Job ${jobId}: Prompt #${job.prompt_id} not found (deleted?)`);
+      updateJob(jobId, { status: "error", error: `Prompt #${job.prompt_id} not found (deleted?)` });
+      continue;
+    }
+    jobDataList.push({ job, prompt });
+  }
+
+  if (jobDataList.length === 0) return;
+
+  const account = db.prepare("SELECT * FROM gemini_accounts WHERE id = ?").get(accountId);
+  if (!account) {
+    for (const { job } of jobDataList) {
+      updateJob(job.id, { status: "error", error: "Account not found" });
+    }
+    return;
+  }
+
+  // Get shared config from first job
+  const firstPrompt = jobDataList[0].prompt;
+  const promptGroup = db.prepare("SELECT * FROM prompt_groups WHERE id = ?").get(firstPrompt.group_id);
+  const imageStyle = promptGroup?.image_style || "";
+  const isLineDrawing = firstPrompt.mode === "line_drawing";
+
+  // Build JOBS_JSON
+  const jobsJson = jobDataList.map(({ job, prompt }) => ({
+    promptText: prompt.content,
+    outputPrefix: isLineDrawing ? `line_${job.id}` : `mockup_${job.id}`,
+  }));
+
+  // Update first job to processing, rest stay pending (they'll be updated in real-time)
+  updateJob(jobDataList[0].job.id, { status: "processing", account_id: accountId });
+  for (let i = 1; i < jobDataList.length; i++) {
+    updateJob(jobDataList[i].job.id, { status: "pending", account_id: accountId });
+  }
+
+  const jobIdsStr = jobDataList.map((d) => d.job.id).join(",");
+  console.log(
+    `[Batch ${batchKey}] Processing ${jobDataList.length} jobs [${jobIdsStr}] as single conversation on account ${account.email}`
+  );
+
+  const completedSet = new Set();
+  try {
+    // completedSet is declared outside try so catch can reference it
+    await runBatchAutomation({
+      cookieDir: account.cookie_dir,
+      imagePath: path.resolve(__dirname, "../../../uploads", jobDataList[0].job.original_image),
+      imageStyle,
+      skipImageTool: isLineDrawing,
+      jobsJson: JSON.stringify(jobsJson),
+      onLine: (line) => {
+        // Real-time status: "STARTING:index" = mark job as processing
+        if (line.startsWith("STARTING:")) {
+          const idx = parseInt(line.substring(9));
+          if (idx >= 0 && idx < jobDataList.length) {
+            const { job } = jobDataList[idx];
+            updateJob(job.id, { status: "processing" });
+            console.log(`[Job ${job.id}] PROCESSING (real-time)`);
+          }
+          return;
+        }
+        // Per-job error within batch (after 3 in-conversation retries)
+        if (line.startsWith("JOB_ERROR:")) {
+          const idx = parseInt(line.substring(10));
+          if (idx >= 0 && idx < jobDataList.length) {
+            const { job } = jobDataList[idx];
+            console.warn(`[Job ${job.id}] FAILED within batch (per-job retries exhausted)`);
+          }
+          return;
+        }
+        // Real-time result: "index:filename" = mark job as done
+        const colonIdx = line.indexOf(":");
+        if (colonIdx < 0) return;
+        const idx = parseInt(line.substring(0, colonIdx));
+        const filename = line.substring(colonIdx + 1).trim();
+        if (idx >= 0 && idx < jobDataList.length && filename) {
+          const { job } = jobDataList[idx];
+          updateJob(job.id, { mockup_image: filename, status: "done" });
+          completedSet.add(idx);
+          console.log(`[Job ${job.id}] DONE (real-time): ${filename}`);
+        }
+      },
+    });
+
+    // Mark any jobs that didn't produce output as error
+    for (let i = 0; i < jobDataList.length; i++) {
+      if (!completedSet.has(i)) {
+        const { job } = jobDataList[i];
+        if (job.status !== "done") {
+          updateJob(job.id, { status: "error", error: "No output received from automation" });
+          console.warn(`[Job ${job.id}] No output line received`);
+        }
+      }
+    }
+
+    console.log(`[Batch ${batchKey}] All ${jobDataList.length} jobs completed (${completedSet.size} succeeded)`);
+  } catch (err) {
+    // ── Rate limit handling: mark account, return incomplete jobs to pending ──
+    if (err.rateLimited || err.message === "RATE_LIMITED") {
+      const allIds = jobDataList.map((d) => d.job.id);
+      const failedIds = allIds.filter((_, i) => !completedSet.has(i));
+
+      console.warn(
+        `[Batch ${batchKey}] RATE LIMITED on account #${accountId}. ` +
+        `${completedSet.size}/${allIds.length} done, ${failedIds.length} returning to pending.`
+      );
+
+      // Mark account as rate-limited (24h cooldown)
+      markAccountRateLimited(accountId);
+
+      // Return incomplete jobs to pending WITHOUT incrementing retry_count
+      for (const id of failedIds) {
+        updateJob(id, { status: "pending", error: null, account_id: null });
+      }
+
+      // Release account from batch and try to pick another account
+      const batch = batches.get(batchKey);
+      if (batch) {
+        batch.accountId = null;
+        // Re-enqueue ALL failed jobs so they can be picked up by another account
+        for (const id of failedIds) {
+          if (!batch.jobs.includes(id)) batch.jobs.push(id);
+        }
+      }
+
+      // Try to start with another account immediately
+      scheduleWaiting();
+      if (batch && !batch.processing) {
+        setTimeout(() => startBatch(batchKey), 500);
+      }
+      return;
+    }
+
+    // Batch failed — retry in a new conversation, up to MAX_BATCH_RETRIES times.
+    const allIds = jobDataList.map((d) => d.job.id);
+    const failedIds = allIds.filter((_, i) => !completedSet.has(i));
+
+    if (failedIds.length === 0) {
+      console.log(`[Batch ${batchKey}] Error occurred but all ${allIds.length} jobs already completed ✓`);
+      return;
+    }
+
+    const currentRetry = Math.max(...jobDataList.map(({ job }) => job.retry_count || 0));
+    const next = currentRetry + 1;
+
+    if (next > MAX_BATCH_RETRIES) {
+      console.error(
+        `[Batch ${batchKey}] Reached max retries (${MAX_BATCH_RETRIES}). Marking ${failedIds.length} remaining jobs as error.`
+      );
+      for (const id of failedIds) {
+        updateJob(id, {
+          status: "error",
+          error: `Batch failed after ${MAX_BATCH_RETRIES} retries: ${err.message.slice(0, 300)}`,
+          retry_count: next,
+        });
+      }
+      return;
+    }
+
+    console.warn(
+      `[Batch ${batchKey}] Error (attempt ${next}/${MAX_BATCH_RETRIES}): ${err.message.slice(0, 200)} — retrying ALL ${allIds.length} jobs in new conversation in ${RETRY_DELAY_SEC}s`
+    );
+
+    // Reset ALL jobs for fresh batch — prompts are sequential and reference each other,
+    // so we must replay the entire conversation to maintain consistency.
+    for (const id of allIds) {
+      updateJob(id, { status: "pending", error: err.message, retry_count: next, mockup_image: null });
+    }
+
+    pendingRetries.set(batchKey, (pendingRetries.get(batchKey) || 0) + 1);
+    setTimeout(() => {
+      pendingRetries.set(batchKey, (pendingRetries.get(batchKey) || 1) - 1);
+      const batch = batches.get(batchKey);
+      if (batch) {
+        // Release old account and pick a new free one
+        const oldAccountId = batch.accountId;
+        if (oldAccountId) {
+          scheduleCooldown(oldAccountId);
+          batch.accountId = null;
+          console.log(`[Batch ${batchKey}] Released account #${oldAccountId} for retry, will pick new account`);
+        }
+        // Re-enqueue ALL jobs — conversation must be replayed in full
+        for (const id of allIds) {
+          if (!batch.jobs.includes(id)) batch.jobs.push(id);
+        }
+        if (!batch.processing) startBatch(batchKey);
+      } else {
+        batches.set(batchKey, { accountId: null, jobs: [...allIds], processing: false, minJobId: Math.min(...allIds) });
+        startBatch(batchKey);
+      }
+    }, RETRY_DELAY_SEC * 1000);
+  }
+}
+
+/**
+ * Process a single job with a specific account.
+ */
+async function processJob(jobId, accountId) {
+  const job = db.prepare("SELECT * FROM jobs WHERE id = ?").get(jobId);
+  if (!job || job.status === "done") return;
+
+  const account = db.prepare("SELECT * FROM gemini_accounts WHERE id = ?").get(accountId);
+  if (!account) {
+    updateJob(jobId, { status: "error", error: "Account not found" });
+    return;
+  }
+
+  updateJob(jobId, { status: "processing", account_id: accountId });
+
+  const prompt = db.prepare("SELECT * FROM prompts WHERE id = ?").get(job.prompt_id);
+  if (!prompt) {
+    console.error(`[Job ${jobId}] Prompt #${job.prompt_id} not found (deleted?)`);
+    updateJob(jobId, { status: "error", error: `Prompt #${job.prompt_id} not found (deleted?)` });
+    return;
+  }
+  const promptGroup = db.prepare("SELECT * FROM prompt_groups WHERE id = ?").get(prompt.group_id);
+  const imageStyle = promptGroup?.image_style || "";
+  const isLineDrawing = prompt?.mode === "line_drawing";
+
+  console.log(
+    `[Job ${jobId}] Starting with account ${account.email} (mode: ${prompt?.mode}, prompt: ${prompt?.content?.slice(0, 50)}...)`
+  );
+
+  try {
+    const outputPrefix = isLineDrawing ? `line_${jobId}` : `mockup_${jobId}`;
+    const outputFile = await runAutomation({
+      cookieDir: account.cookie_dir,
+      imagePath: path.resolve(__dirname, "../../../uploads", job.original_image),
+      promptText: prompt.content,
+      outputPrefix,
+      imageStyle,
+      skipImageTool: isLineDrawing,
+    });
+    updateJob(jobId, { mockup_image: outputFile, status: "done" });
+    console.log(`[Job ${jobId}] DONE: ${outputFile}`);
+  } catch (err) {
+    // ── Rate limit: mark account, return job to pending
+    if (err.rateLimited || err.message === "RATE_LIMITED") {
+      console.warn(`[Job ${jobId}] RATE LIMITED on account #${accountId}`);
+      markAccountRateLimited(accountId);
+      updateJob(jobId, { status: "pending", error: null, account_id: null });
+
+      const batchKey = getBatchKey(jobId);
+      const batch = batches.get(batchKey);
+      if (batch) {
+        batch.accountId = null;
+        if (!batch.jobs.includes(jobId)) batch.jobs.unshift(jobId);
+      }
+      scheduleWaiting();
+      if (batch && !batch.processing) {
+        setTimeout(() => startBatch(batchKey), 500);
+      }
+      return;
+    }
+
+    const currentRetry = job.retry_count || 0;
+    if (currentRetry < MAX_RETRIES) {
+      const next = currentRetry + 1;
+      const delaySec = RETRY_DELAYS[currentRetry] || 5;
+      console.warn(`[Job ${jobId}] Error (attempt ${next}/${MAX_RETRIES}): ${err.message} — will retry in ${delaySec}s`);
+      updateJob(jobId, { status: "pending", error: err.message, retry_count: next });
+      // Track that a retry is pending for this batch
+      const batchKey = getBatchKey(jobId);
+      pendingRetries.set(batchKey, (pendingRetries.get(batchKey) || 0) + 1);
+      // Re-add to SAME batch after delay
+      setTimeout(() => {
+        pendingRetries.set(batchKey, (pendingRetries.get(batchKey) || 1) - 1);
+        const batch = batches.get(batchKey);
+        if (batch) {
+          batch.jobs.unshift(jobId);
+          if (!batch.processing) startBatch(batchKey);
+        } else {
+          // Batch was already cleaned up — re-enqueue fresh
+          enqueueJob(jobId);
+        }
+      }, delaySec * 1000);
+    } else {
+      console.error(`[Job ${jobId}] Error after ${MAX_RETRIES} retries:`, err.message);
+      updateJob(jobId, { status: "error", error: err.message });
+    }
+  }
+}
+
+// ── Startup: reset stuck accounts & re-queue pending jobs ───
+
+function resetStuckAccounts() {
+  const result = db
+    .prepare("UPDATE gemini_accounts SET status = 'free' WHERE status IN ('busy', 'cooldown')")
+    .run();
+  if (result.changes > 0) {
+    console.log(`[JobRunner] Reset ${result.changes} stuck account(s) to free`);
+  }
+
+  // Log rate-limited accounts
+  const rateLimited = db
+    .prepare("SELECT id, email, rate_limited_until FROM gemini_accounts WHERE rate_limited_until > datetime('now')")
+    .all();
+  if (rateLimited.length > 0) {
+    for (const a of rateLimited) {
+      console.log(`[JobRunner] Account #${a.id} (${a.email}) rate-limited until ${a.rate_limited_until}`);
+    }
+  }
+
+  const jobResult = db
+    .prepare("UPDATE jobs SET status = 'pending' WHERE status = 'processing'")
+    .run();
+  if (jobResult.changes > 0) {
+    console.log(`[JobRunner] Reset ${jobResult.changes} stuck job(s) to pending`);
+  }
+
+  // Re-queue pending jobs, grouped by batch
+  const pendingJobs = db
+    .prepare("SELECT id, batch_id FROM jobs WHERE status = 'pending' ORDER BY id ASC")
+    .all();
+  for (const j of pendingJobs) {
+    const batchKey = j.batch_id || `single_${j.id}`;
+    if (!batches.has(batchKey)) {
+      batches.set(batchKey, { accountId: null, jobs: [], processing: false, minJobId: j.id });
+    }
+    const batch = batches.get(batchKey);
+    batch.jobs.push(j.id);
+    if (j.id < batch.minJobId) batch.minJobId = j.id;
+  }
+  if (pendingJobs.length > 0) {
+    console.log(`[JobRunner] Re-queued ${pendingJobs.length} pending job(s) across ${batches.size} batch(es)`);
+    // Start batches in order — oldest (lowest minJobId) first
+    const sortedBatchKeys = [...batches.keys()].sort((a, b) => {
+      const batchA = batches.get(a);
+      const batchB = batches.get(b);
+      return (batchA?.minJobId || Infinity) - (batchB?.minJobId || Infinity);
+    });
+    for (const batchKey of sortedBatchKeys) {
+      startBatch(batchKey);
+    }
+  }
+}
+resetStuckAccounts();
+
+module.exports = { enqueueJob };

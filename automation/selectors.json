@@ -1,0 +1,62 @@
+{
+  "_comment": "Gemini DOM selectors config. Update here when Gemini changes its UI. Worker falls back to hardcoded defaults if this file is missing.",
+
+  "create_image_terms": ["tạo hình ảnh", "create image", "generate image", "image generation"],
+  "upload_button_aria": ["tải tệp", "upload", "mở trình đơn", "add file", "attach", "insert file"],
+  "upload_menu_terms": ["tải tệp", "upload file", "upload from computer", "from computer"],
+  "consent_terms": ["đồng ý", "agree", "i agree"],
+  "send_aria_terms": ["send", "gửi", "submit"],
+  "new_chat_terms": ["cuộc trò chuyện mới", "new chat", "new conversation"],
+  "new_chat_href": "/app",
+  "style_gallery_heading": ["chọn một kiểu", "choose a style", "select a style", "pick a style"],
+  "dismiss_button_terms": ["got it", "dismiss", "ok", "đồng ý", "i understand", "close", "đóng", "skip", "bỏ qua", "no thanks", "not now"],
+  "popup_dismiss_terms": ["got it", "dismiss", "ok", "đồng ý", "i understand", "close", "đóng", "skip", "bỏ qua", "no thanks", "not now", "dùng thử", "cancel", "hủy", "later", "để sau", "no", "không", "maybe later", "remind me later", "nhắc tôi sau", "không phải bây giờ", "từ chối"],
+  "popup_close_aria": ["close", "đóng", "dismiss", "cancel", "hủy", "tắt"],
+  "mode_text_keywords": ["nhanh", "pro", "flash", "ultra"],
+  "mode_aria_keywords": ["chế độ", "mode", "bộ chọn", "model", "selector"],
+  "rate_limit_terms": [
+    "can't generate more images", "cannot generate more images",
+    "đạt đến giới hạn", "giới hạn tạo hình ảnh",
+    "come back tomorrow", "vui lòng đợi đến",
+    "reached the limit", "rate limit", "too many requests"
+  ],
+  "error_terms": ["lỗi", "error", "failed", "something went wrong"],
+  "creating_terms": ["creating your image", "đang tạo", "generating image", "creating image"],
+  "stop_terms": ["stop", "cancel", "dừng", "hủy"],
+  "close_button_aria": ["remove", "xóa", "close", "delete", "đóng", "discard"],
+
+  "overlay_container": ".cdk-overlay-container",
+  "dialog_selectors": ".image-expansion-dialog, .image-expansion-dialog-backdrop",
+  "input_selectors": [
+    ".ql-editor[contenteditable='true']",
+    "[contenteditable='true'][aria-label*='Hỏi']",
+    "[contenteditable='true'][aria-label*='prompt']",
+    "[contenteditable='true'][aria-label*='Nhập']",
+    "[contenteditable='true'][aria-label*='Enter']",
+    "[contenteditable='true'][aria-label*='Type']",
+    "div[contenteditable='true']",
+    "textarea"
+  ],
+  "focus_selectors": [
+    ".ql-editor[contenteditable='true']",
+    "[contenteditable='true']",
+    "textarea"
+  ],
+  "style_card_selectors": "media-gen-template-card, .style-card, [class*='template-card']",
+  "style_card_extended": "media-gen-template-card, .style-card, [class*='template'], [class*='style'], [role='option'], [role='listitem'], .media-gen-zero-state-shell [role='button'], image-generation-zero-state [role='button']",
+  "gallery_containers": "media-gen-zero-state-shell, image-generation-zero-state, [class*='style-gallery'], [class*='template-gallery']",
+  "response_element": "response-element",
+  "generated_image_selectors": "generated-image img, .single-image img, .image-card img",
+  "template_card": "media-gen-template-card",
+  "input_preview_selectors": "user-query-file-preview, user-query-file-carousel",
+  "thinking_selectors": ".thinking-label, .thought-chip, [class*='thinking'], [class*='thought']",
+  "spinner_selectors": ".loading-indicator, [role='progressbar'], .spinner",
+  "error_element_selectors": "snack-bar, .snackbar, [role='alert'], .error-message, .mdc-snackbar",
+  "user_msg_selectors": "user-query, .user-message, .query-content",
+
+  "viewport_bottom_ratio": 0.4,
+  "sidebar_x_threshold": 100,
+  "image_min_size": 200,
+  "input_area_bottom_px": 250,
+  "style_text_max_length": 100
+}
