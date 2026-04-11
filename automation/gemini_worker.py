@@ -376,7 +376,7 @@ def _launch_browser(p):
             "--disable-dev-shm-usage",
             "--disable-extensions",
             "--lang=vi-VN,vi,en-US,en",
-            "--window-position=-100,-100",
+            "--window-position=-2400,-2400",
         ],
         viewport={"width": 1280, "height": 900},
         accept_downloads=True,
