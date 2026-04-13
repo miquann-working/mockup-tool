@@ -182,7 +182,7 @@ export default function AdminAccountsPage() {
     }
   };
 
-  const handleUploadCookie = async () => {
+    const handleUploadCookie = async () => {
     if (!email.trim() || !cookieFile) return;
     setUploading(true);
     try {
