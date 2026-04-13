@@ -186,6 +186,8 @@ def main():
             _extra_args.append("--headless=new")
         else:
             _extra_args.append("--window-position=-9999,-9999")
+        import tempfile as _tempfile
+        _cache_dir = _tempfile.mkdtemp(prefix="chromium_cache_")
         browser = p.chromium.launch_persistent_context(
             user_data_dir=COOKIE_DIR,
             headless=False,
@@ -197,6 +199,9 @@ def main():
                 "--disable-extensions",
                 "--disable-component-extensions-with-background-pages",
                 "--lang=vi-VN,vi,en-US,en",
+                f"--disk-cache-dir={_cache_dir}",
+                "--disk-cache-size=1",
+                "--media-cache-size=1",
             ] + _extra_args,
             viewport={"width": 1280, "height": 900},
             accept_downloads=True,
@@ -378,6 +383,8 @@ def _launch_browser(p):
         _extra_args.append("--headless=new")
     else:
         _extra_args.append("--window-position=-9999,-9999")
+    import tempfile as _tempfile
+    _cache_dir = _tempfile.mkdtemp(prefix="chromium_cache_")
     browser = p.chromium.launch_persistent_context(
         user_data_dir=COOKIE_DIR,
         headless=False,
@@ -389,6 +396,9 @@ def _launch_browser(p):
             "--disable-extensions",
             "--disable-component-extensions-with-background-pages",
             "--lang=vi-VN,vi,en-US,en",
+            f"--disk-cache-dir={_cache_dir}",
+            "--disk-cache-size=1",
+            "--media-cache-size=1",
         ] + _extra_args,
         viewport={"width": 1280, "height": 900},
         accept_downloads=True,
