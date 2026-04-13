@@ -182,14 +182,13 @@ export default function AdminAccountsPage() {
     }
   };
 
-    const handleUploadCookie = async () => {
+  const handleUploadCookie = async () => {
     if (!email.trim() || !cookieFile) return;
     setUploading(true);
     try {
       const fd = new FormData();
       fd.append("email", email.trim());
       fd.append("cookies", cookieFile);
-      // Upload trực tiếp tới backend (bypass Next.js proxy 10MB limit)
       const token = localStorage.getItem("token");
       const backendUrl = window.location.protocol + "//" + window.location.hostname + ":4000";
       const resp = await fetch(backendUrl + "/api/accounts/upload", {
