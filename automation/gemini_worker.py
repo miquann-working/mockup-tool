@@ -150,6 +150,27 @@ def _selector_fail_screenshot(page, func_name, context=""):
         pass
 
 
+def _import_exported_cookies(browser, cookie_dir):
+    """Import plaintext cookies from exported_cookies.json if present.
+
+    When cookies are exported on Windows and used on Linux, Chromium's
+    native encrypted cookie store is incompatible (DPAPI vs keyring).
+    This injects the plaintext cookies via Playwright API to bypass
+    the encryption layer entirely.
+    """
+    json_path = os.path.join(cookie_dir, "exported_cookies.json")
+    if not os.path.isfile(json_path):
+        return
+    try:
+        with open(json_path, "r", encoding="utf-8") as f:
+            cookies = json.load(f)
+        if cookies:
+            browser.add_cookies(cookies)
+            log(f"Imported {len(cookies)} cookies from exported_cookies.json")
+    except Exception as e:
+        log(f"Warning: could not import exported cookies: {e}")
+
+
 def main():
     if JOBS_JSON:
         return main_batch()
@@ -204,6 +225,7 @@ def main():
                 "--disable-extensions",
                 "--disable-component-extensions-with-background-pages",
                 "--lang=vi-VN,vi,en-US,en",
+                "--password-store=basic",
                 f"--disk-cache-dir={_cache_dir}",
                 "--disk-cache-size=1",
                 "--media-cache-size=1",
@@ -256,6 +278,9 @@ def main():
 
         # Inject configurable selectors for JS access
         browser.add_init_script("window.__SEL = " + json.dumps(SEL) + ";")
+
+        # Import plaintext cookies for cross-platform compatibility
+        _import_exported_cookies(browser, COOKIE_DIR)
 
         # Use the first existing page; close any extra tabs from restored session
         page = browser.pages[0]
@@ -424,6 +449,7 @@ def _launch_browser(p):
             "--disable-extensions",
             "--disable-component-extensions-with-background-pages",
             "--lang=vi-VN,vi,en-US,en",
+            "--password-store=basic",
             f"--disk-cache-dir={_cache_dir}",
             "--disk-cache-size=1",
             "--media-cache-size=1",
@@ -455,6 +481,9 @@ def _launch_browser(p):
 
     # Inject configurable selectors for JS access
     browser.add_init_script("window.__SEL = " + json.dumps(SEL) + ";")
+
+    # Import plaintext cookies for cross-platform compatibility
+    _import_exported_cookies(browser, COOKIE_DIR)
 
     page = browser.pages[0]
     for extra in browser.pages[1:]:

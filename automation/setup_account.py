@@ -12,6 +12,7 @@ A zip file is also created for uploading to the server via admin panel.
 import os
 import sys
 import time
+import json
 import zipfile
 
 
@@ -52,6 +53,7 @@ def setup_account(email):
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
                 "--disable-infobars",
+                "--password-store=basic",
                 "--window-position=100,100",
             ],
             viewport={"width": 1280, "height": 900},
@@ -99,6 +101,19 @@ def setup_account(email):
             return None
 
         print(f"\nLogin successful!")
+
+        # Export cookies as plaintext JSON for cross-platform portability
+        # (Chromium encrypts cookies differently on Windows vs Linux,
+        #  so we save decrypted cookies via Playwright API)
+        try:
+            cookies = browser.cookies()
+            cookies_json_path = os.path.join(cookie_dir, "exported_cookies.json")
+            with open(cookies_json_path, "w", encoding="utf-8") as f:
+                json.dump(cookies, f)
+            print(f"Exported {len(cookies)} cookies to exported_cookies.json")
+        except Exception as e:
+            print(f"Warning: could not export cookies JSON: {e}")
+
         browser.close()
 
     return cookie_dir
