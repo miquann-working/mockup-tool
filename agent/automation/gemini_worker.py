@@ -181,9 +181,6 @@ def main():
 
     with sync_playwright() as p:
         _cleanup_chrome_lock(COOKIE_DIR)
-        # --headless=new: Chromium's new headless renders identically to headed mode
-        # We set Playwright headless=False and pass the flag manually to avoid
-        # Playwright's old headless shell which is easily detected.
         _extra_args = []
         if HEADLESS:
             _extra_args.append("--headless=new")
@@ -216,34 +213,13 @@ def main():
 
         # Inject anti-detection script BEFORE any page loads
         browser.add_init_script("""
-            // Override navigator.webdriver to hide automation
             Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-
-            // Ensure window.chrome exists (real Chrome always has this)
             if (!window.chrome) {
                 window.chrome = { runtime: {}, csi: function(){}, loadTimes: function(){} };
             }
-
-            // Override plugins to look like real Chrome
-            Object.defineProperty(navigator, 'plugins', {
-                get: () => [1, 2, 3, 4, 5],
-            });
-
-            // Override languages
-            Object.defineProperty(navigator, 'languages', {
-                get: () => ['vi-VN', 'vi', 'en-US', 'en'],
-            });
-
-            // Fix permissions query for notifications
-            const originalQuery = window.Notification && Notification.permission;
-            if (window.Notification) {
-                Notification.permission = 'default';
-            }
-
-            // Override hardware concurrency to realistic value
+            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+            Object.defineProperty(navigator, 'languages', { get: () => ['vi-VN', 'vi', 'en-US', 'en'] });
             Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 4 });
-
-            // Override deviceMemory
             Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
         """)
 

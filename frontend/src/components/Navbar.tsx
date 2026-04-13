@@ -17,6 +17,7 @@ export default function Navbar() {
       ? [
           { href: "/admin/accounts", label: "Accounts" },
           { href: "/admin/users", label: "Users" },
+          { href: "/admin/vps", label: "VPS" },
         ]
       : []),
   ];

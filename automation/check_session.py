@@ -25,16 +25,22 @@ def main():
         print("playwright_not_installed")
         sys.exit(1)
 
+    HEADLESS = os.environ.get("HEADLESS", "0") == "1"
+
     with sync_playwright() as p:
+        launch_args = [
+            "--disable-blink-features=AutomationControlled",
+            "--no-sandbox",
+            "--disable-gpu",
+            "--window-position=-2400,-2400",
+        ]
+        if HEADLESS:
+            launch_args.append("--headless=new")
+
         browser = p.chromium.launch_persistent_context(
             user_data_dir=COOKIE_DIR,
             headless=False,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--disable-gpu",
-                "--window-position=-2400,-2400",
-            ],
+            args=launch_args,
             viewport={"width": 1280, "height": 900},
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
         )

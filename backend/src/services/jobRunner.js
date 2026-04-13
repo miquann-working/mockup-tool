@@ -1,5 +1,6 @@
 const { spawn } = require("child_process");
 const path = require("path");
+const fs = require("fs");
 const db = require("../db");
 
 const PYTHON = process.env.PYTHON_BIN || "python";
@@ -11,17 +12,44 @@ const MAX_BATCH_RETRIES = 3; // max times to retry entire batch before giving up
 const RETRY_DELAYS = [5, 10, 7, 8, 5]; // single-job retry delays
 const BATCH_TIMEOUT_MS = 15 * 60 * 1000; // 15 min timeout for entire batch Python process
 
+// VPS dispatch constants
+const OUTPUTS_DIR = path.resolve(__dirname, "../../../outputs");
+const CALLBACK_BASE_URL = process.env.CALLBACK_BASE_URL || `http://localhost:${process.env.PORT || 4000}`;
+const VPS_CALLBACK_URL = `${CALLBACK_BASE_URL}/api/vps/job-callback`;
+
 // Track how many pending retries exist per batch so we don't release account too early
 // Map<batchKey, number>
 const pendingRetries = new Map();
 
 // ── Helpers ─────────────────────────────────────────────────
 
-function pickAccount() {
+function pickAccount(userId) {
+  // Find user's VPS assignment
+  let vpsId = null;
+  if (userId) {
+    const user = db.prepare("SELECT vps_id FROM users WHERE id = ?").get(userId);
+    vpsId = user?.vps_id;
+  }
+
+  if (vpsId) {
+    // Pick free account on user's VPS
+    return db
+      .prepare(
+        `SELECT * FROM gemini_accounts
+         WHERE status = 'free'
+           AND vps_id = ?
+           AND (rate_limited_until IS NULL OR rate_limited_until < datetime('now'))
+         ORDER BY last_used_at ASC LIMIT 1`
+      )
+      .get(vpsId);
+  }
+
+  // No VPS assignment — pick local account (vps_id IS NULL)
   return db
     .prepare(
       `SELECT * FROM gemini_accounts
        WHERE status = 'free'
+         AND vps_id IS NULL
          AND (rate_limited_until IS NULL OR rate_limited_until < datetime('now'))
        ORDER BY last_used_at ASC LIMIT 1`
     )
@@ -178,6 +206,87 @@ function runBatchAutomation({ cookieDir, imagePath, imageStyle, skipImageTool, j
   });
 }
 
+// ── VPS dispatch helpers ────────────────────────────────────
+
+function getVpsNode(vpsId) {
+  return db.prepare("SELECT * FROM vps_nodes WHERE id = ?").get(vpsId);
+}
+
+/** Build base URL for a VPS node.
+ *  If host starts with http(s), treat as full URL (Cloudflare Tunnel, etc.).
+ *  Otherwise build http://host:port. */
+function getAgentBaseUrl(node) {
+  if (node.host.startsWith("http://") || node.host.startsWith("https://")) {
+    return node.host.replace(/\/+$/, ""); // strip trailing slash
+  }
+  return `http://${node.host}:${node.port}`;
+}
+
+async function dispatchSingleToVps(vpsNode, params) {
+  const {
+    jobId, cookieDir, imagePath, promptText, outputPrefix,
+    imageStyle, skipImageTool, batchKey,
+  } = params;
+
+  const url = `${getAgentBaseUrl(vpsNode)}/agent/execute`;
+  const formData = new FormData();
+  const fileBuffer = fs.readFileSync(imagePath);
+  formData.append("image", new Blob([fileBuffer]), path.basename(imagePath));
+  formData.append("job_id", String(jobId));
+  formData.append("cookie_dir", path.basename(cookieDir));
+  formData.append("prompt_text", promptText);
+  formData.append("output_prefix", outputPrefix);
+  formData.append("image_style", imageStyle || "");
+  formData.append("skip_image_tool", skipImageTool ? "1" : "");
+  formData.append("callback_url", VPS_CALLBACK_URL);
+  formData.append("batch_key", batchKey || "");
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "X-Api-Key": vpsNode.secret_key },
+    body: formData,
+    signal: AbortSignal.timeout(30_000),
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`VPS dispatch failed: HTTP ${res.status} ${text.slice(0, 200)}`);
+  }
+  return await res.json();
+}
+
+async function dispatchBatchToVps(vpsNode, params) {
+  const {
+    cookieDir, imagePath, imageStyle, skipImageTool,
+    jobsJson, jobIds, batchKey,
+  } = params;
+
+  const url = `${getAgentBaseUrl(vpsNode)}/agent/execute-batch`;
+  const formData = new FormData();
+  const fileBuffer = fs.readFileSync(imagePath);
+  formData.append("image", new Blob([fileBuffer]), path.basename(imagePath));
+  formData.append("cookie_dir", path.basename(cookieDir));
+  formData.append("image_style", imageStyle || "");
+  formData.append("skip_image_tool", skipImageTool ? "1" : "");
+  formData.append("jobs_json", jobsJson);
+  formData.append("job_ids", JSON.stringify(jobIds));
+  formData.append("callback_url", VPS_CALLBACK_URL);
+  formData.append("batch_key", batchKey);
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "X-Api-Key": vpsNode.secret_key },
+    body: formData,
+    signal: AbortSignal.timeout(30_000),
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`VPS batch dispatch failed: HTTP ${res.status} ${text.slice(0, 200)}`);
+  }
+  return await res.json();
+}
+
 // ── Parallel batch runner ───────────────────────────────────
 // Each batch (same batch_id) runs on ONE account, jobs sequential within batch.
 // Different batches run in PARALLEL on different accounts.
@@ -245,7 +354,10 @@ function startBatch(batchKey) {
 
   // Assign account if not yet assigned
   if (!batch.accountId) {
-    const account = pickAccount();
+    // Get userId from first job in batch for VPS-aware account selection
+    const firstJobId = batch.jobs[0];
+    const firstJob = firstJobId ? db.prepare("SELECT user_id FROM jobs WHERE id = ?").get(firstJobId) : null;
+    const account = pickAccount(firstJob?.user_id);
     if (!account) {
       // No free account — queue this batch for later (oldest first)
       if (!waitingBatches.includes(batchKey)) {
@@ -273,7 +385,13 @@ function startBatch(batchKey) {
     const allJobIds = [...batch.jobs];
     batch.jobs = [];
     processBatchJobs(allJobIds, batch.accountId, batchKey)
-      .finally(() => {
+      .then((result) => {
+        if (result === "vps_dispatched") return; // VPS callback handles completion
+        batch.processing = false;
+        setTimeout(() => startBatch(batchKey), 200);
+      })
+      .catch((err) => {
+        console.error(`[Batch ${batchKey}] Unhandled error:`, err.message);
         batch.processing = false;
         setTimeout(() => startBatch(batchKey), 200);
       });
@@ -283,7 +401,8 @@ function startBatch(batchKey) {
   // Single job: existing one-by-one behavior
   const jobId = batch.jobs.shift();
   processJob(jobId, batch.accountId)
-    .then(() => {
+    .then((result) => {
+      if (result === "vps_dispatched") return; // VPS callback handles completion
       batch.processing = false;
       setTimeout(() => startBatch(batchKey), 200);
     })
@@ -308,10 +427,10 @@ function startBatch(batchKey) {
  * Called when an account becomes free — try to start waiting batches.
  */
 function scheduleWaiting() {
-  while (waitingBatches.length > 0) {
-    const account = pickAccount();
-    if (!account) break; // no more free accounts
-    const batchKey = waitingBatches.shift();
+  // Try to start each waiting batch — startBatch will pickAccount with correct userId
+  const toRetry = [...waitingBatches];
+  waitingBatches.length = 0;
+  for (const batchKey of toRetry) {
     if (batches.has(batchKey)) {
       startBatch(batchKey);
     }
@@ -345,6 +464,12 @@ async function processBatchJobs(jobIds, accountId, batchKey) {
     for (const { job } of jobDataList) {
       updateJob(job.id, { status: "error", error: "Account not found" });
     }
+    const batch = batches.get(batchKey);
+    if (batch) {
+      batch.processing = false;
+      batch.jobs = [];
+    }
+    releaseBatchAfterVps(batchKey);
     return;
   }
 
@@ -360,13 +485,98 @@ async function processBatchJobs(jobIds, accountId, batchKey) {
     outputPrefix: isLineDrawing ? `line_${job.id}` : `mockup_${job.id}`,
   }));
 
+  const jobIdsStr = jobDataList.map((d) => d.job.id).join(",");
+
+  // ── VPS dispatch ──────────────────────────────────────────
+  if (account.vps_id) {
+    const vpsNode = getVpsNode(account.vps_id);
+    if (!vpsNode || vpsNode.status !== "online") {
+      console.error(`[Batch ${batchKey}] VPS #${account.vps_id} is offline or not found`);
+      for (const { job } of jobDataList) {
+        updateJob(job.id, { status: "error", error: `VPS #${account.vps_id} is offline or not found` });
+      }
+      // Release account and let waiting batches proceed
+      const batch = batches.get(batchKey);
+      if (batch) {
+        batch.processing = false;
+        batch.jobs = [];
+      }
+      releaseBatchAfterVps(batchKey);
+      return;
+    }
+
+    // Only set account_id, keep status "pending" — agent "starting" callback
+    // will mark each job "processing" one-by-one as it actually runs
+    for (const { job } of jobDataList) {
+      updateJob(job.id, { account_id: accountId });
+    }
+
+    try {
+      const jobIdsForVps = jobDataList.map((d) => d.job.id);
+      await dispatchBatchToVps(vpsNode, {
+        cookieDir: account.cookie_dir,
+        imagePath: path.resolve(__dirname, "../../../uploads", jobDataList[0].job.original_image),
+        imageStyle,
+        skipImageTool: isLineDrawing,
+        jobsJson: JSON.stringify(jobsJson),
+        jobIds: jobIdsForVps,
+        batchKey,
+      });
+      console.log(`[Batch ${batchKey}] Dispatched ${jobDataList.length} jobs [${jobIdsStr}] to VPS ${vpsNode.name}`);
+      return "vps_dispatched";
+    } catch (dispatchErr) {
+      console.error(`[Batch ${batchKey}] VPS dispatch failed: ${dispatchErr.message}`);
+      const currentRetry = Math.max(...jobDataList.map(({ job }) => job.retry_count || 0));
+      const next = currentRetry + 1;
+
+      if (next > MAX_BATCH_RETRIES) {
+        for (const { job } of jobDataList) {
+          updateJob(job.id, { status: "error", error: `VPS dispatch failed after ${MAX_BATCH_RETRIES} retries: ${dispatchErr.message}` });
+        }
+        // Release account and let waiting batches proceed
+        const batch = batches.get(batchKey);
+        if (batch) {
+          batch.processing = false;
+          batch.jobs = [];
+        }
+        releaseBatchAfterVps(batchKey);
+        return;
+      }
+
+      const allIds = jobDataList.map((d) => d.job.id);
+      for (const id of allIds) {
+        updateJob(id, { status: "pending", error: dispatchErr.message, retry_count: next, mockup_image: null });
+      }
+      pendingRetries.set(batchKey, (pendingRetries.get(batchKey) || 0) + 1);
+      setTimeout(() => {
+        pendingRetries.set(batchKey, (pendingRetries.get(batchKey) || 1) - 1);
+        const batch = batches.get(batchKey);
+        if (batch) {
+          if (batch.accountId) {
+            scheduleCooldown(batch.accountId);
+            batch.accountId = null;
+          }
+          for (const id of allIds) {
+            if (!batch.jobs.includes(id)) batch.jobs.push(id);
+          }
+          if (!batch.processing) startBatch(batchKey);
+        } else {
+          batches.set(batchKey, { accountId: null, jobs: [...allIds], processing: false, minJobId: Math.min(...allIds) });
+          startBatch(batchKey);
+        }
+      }, RETRY_DELAY_SEC * 1000);
+      return;
+    }
+  }
+
+  // ── Local execution ───────────────────────────────────────
+
   // Update first job to processing, rest stay pending (they'll be updated in real-time)
   updateJob(jobDataList[0].job.id, { status: "processing", account_id: accountId });
   for (let i = 1; i < jobDataList.length; i++) {
     updateJob(jobDataList[i].job.id, { status: "pending", account_id: accountId });
   }
 
-  const jobIdsStr = jobDataList.map((d) => d.job.id).join(",");
   console.log(
     `[Batch ${batchKey}] Processing ${jobDataList.length} jobs [${jobIdsStr}] as single conversation on account ${account.email}`
   );
@@ -548,13 +758,62 @@ async function processJob(jobId, accountId) {
   const promptGroup = db.prepare("SELECT * FROM prompt_groups WHERE id = ?").get(prompt.group_id);
   const imageStyle = promptGroup?.image_style || "";
   const isLineDrawing = prompt?.mode === "line_drawing";
+  const outputPrefix = isLineDrawing ? `line_${jobId}` : `mockup_${jobId}`;
 
+  // ── VPS dispatch ──────────────────────────────────────────
+  if (account.vps_id) {
+    const vpsNode = getVpsNode(account.vps_id);
+    if (!vpsNode || vpsNode.status !== "online") {
+      updateJob(jobId, { status: "error", error: `VPS #${account.vps_id} is offline or not found` });
+      return;
+    }
+
+    const batchKey = getBatchKey(jobId);
+    try {
+      await dispatchSingleToVps(vpsNode, {
+        jobId,
+        cookieDir: account.cookie_dir,
+        imagePath: path.resolve(__dirname, "../../../uploads", job.original_image),
+        promptText: prompt.content,
+        outputPrefix,
+        imageStyle,
+        skipImageTool: isLineDrawing,
+        batchKey,
+      });
+      console.log(`[Job ${jobId}] Dispatched to VPS ${vpsNode.name}`);
+      return "vps_dispatched";
+    } catch (dispatchErr) {
+      console.error(`[Job ${jobId}] VPS dispatch failed: ${dispatchErr.message}`);
+      const currentRetry = job.retry_count || 0;
+      if (currentRetry < MAX_RETRIES) {
+        const next = currentRetry + 1;
+        const delaySec = RETRY_DELAYS[currentRetry] || 5;
+        console.warn(`[Job ${jobId}] VPS retry ${next}/${MAX_RETRIES} in ${delaySec}s`);
+        updateJob(jobId, { status: "pending", error: dispatchErr.message, retry_count: next });
+        pendingRetries.set(batchKey, (pendingRetries.get(batchKey) || 0) + 1);
+        setTimeout(() => {
+          pendingRetries.set(batchKey, (pendingRetries.get(batchKey) || 1) - 1);
+          const batch = batches.get(batchKey);
+          if (batch) {
+            batch.jobs.unshift(jobId);
+            if (!batch.processing) startBatch(batchKey);
+          } else {
+            enqueueJob(jobId);
+          }
+        }, delaySec * 1000);
+      } else {
+        updateJob(jobId, { status: "error", error: dispatchErr.message });
+      }
+      return;
+    }
+  }
+
+  // ── Local execution ───────────────────────────────────────
   console.log(
     `[Job ${jobId}] Starting with account ${account.email} (mode: ${prompt?.mode}, prompt: ${prompt?.content?.slice(0, 50)}...)`
   );
 
   try {
-    const outputPrefix = isLineDrawing ? `line_${jobId}` : `mockup_${jobId}`;
     const outputFile = await runAutomation({
       cookieDir: account.cookie_dir,
       imagePath: path.resolve(__dirname, "../../../uploads", job.original_image),
@@ -613,6 +872,225 @@ async function processJob(jobId, accountId) {
   }
 }
 
+// ── VPS callback handler ────────────────────────────────────
+// Called by the /api/vps/job-callback endpoint when VPS Agent sends results.
+
+function handleVpsCallback(data) {
+  const { type, job_id, batch_key, output_file, error } = data;
+
+  switch (type) {
+    case "starting":
+      if (job_id) {
+        updateJob(job_id, { status: "processing" });
+        console.log(`[VPS] Job ${job_id} processing`);
+      }
+      break;
+
+    case "done": {
+      // Image already saved to outputs/ by the callback endpoint
+      updateJob(job_id, { mockup_image: output_file, status: "done" });
+      console.log(`[VPS] Job ${job_id} DONE: ${output_file}`);
+
+      // For single jobs, release batch now (no batch_complete callback)
+      if (batch_key && batch_key.startsWith("single_")) {
+        releaseBatchAfterVps(batch_key);
+      }
+      break;
+    }
+
+    case "job_error":
+      // Per-job error within a batch — batch_complete will handle retry
+      console.warn(`[VPS] Job ${job_id} error in batch: ${error}`);
+      break;
+
+    case "error":
+      console.warn(`[VPS] Job ${job_id} error: ${error}`);
+      // For single jobs, handle retry
+      if (batch_key && batch_key.startsWith("single_")) {
+        handleVpsSingleError(job_id, batch_key, error);
+      }
+      // For batch jobs, batch_complete handles
+      break;
+
+    case "rate_limited":
+      console.warn(`[VPS] Job ${job_id} RATE LIMITED`);
+      if (batch_key && batch_key.startsWith("single_")) {
+        handleVpsSingleRateLimit(job_id, batch_key);
+      }
+      // For batch: batch_complete follows (with error = RATE_LIMITED)
+      break;
+
+    case "batch_error":
+      // Per-job batch error — batch_complete will follow
+      console.warn(`[VPS] Job ${job_id} batch error: ${error}`);
+      break;
+
+    case "batch_complete":
+      handleVpsBatchComplete(data);
+      break;
+  }
+}
+
+function handleVpsSingleError(jobId, batchKey, errMsg) {
+  const job = db.prepare("SELECT * FROM jobs WHERE id = ?").get(jobId);
+  if (!job) return;
+
+  const currentRetry = job.retry_count || 0;
+  if (currentRetry < MAX_RETRIES) {
+    const next = currentRetry + 1;
+    const delaySec = RETRY_DELAYS[currentRetry] || 5;
+    console.warn(`[VPS] Job ${jobId} retry ${next}/${MAX_RETRIES} in ${delaySec}s`);
+    updateJob(jobId, { status: "pending", error: errMsg, retry_count: next });
+
+    pendingRetries.set(batchKey, (pendingRetries.get(batchKey) || 0) + 1);
+    setTimeout(() => {
+      pendingRetries.set(batchKey, (pendingRetries.get(batchKey) || 1) - 1);
+      const batch = batches.get(batchKey);
+      if (batch) {
+        batch.processing = false;
+        batch.jobs.unshift(jobId);
+        startBatch(batchKey);
+      } else {
+        enqueueJob(jobId);
+      }
+    }, delaySec * 1000);
+  } else {
+    updateJob(jobId, { status: "error", error: errMsg });
+    releaseBatchAfterVps(batchKey);
+  }
+}
+
+function handleVpsSingleRateLimit(jobId, batchKey) {
+  const batch = batches.get(batchKey);
+  if (batch && batch.accountId) {
+    markAccountRateLimited(batch.accountId);
+    batch.accountId = null;
+  }
+
+  updateJob(jobId, { status: "pending", error: null, account_id: null });
+
+  if (batch) {
+    batch.processing = false;
+    if (!batch.jobs.includes(jobId)) batch.jobs.unshift(jobId);
+  }
+
+  scheduleWaiting();
+  if (batch) {
+    setTimeout(() => {
+      if (!batch.processing) startBatch(batchKey);
+    }, 500);
+  }
+}
+
+function handleVpsBatchComplete(data) {
+  const { batch_key, completed = [], total, error } = data;
+  if (!batch_key) return;
+
+  const batch = batches.get(batch_key);
+  if (!batch) return;
+
+  const accountId = batch.accountId;
+
+  if (!error) {
+    // Success — jobs already marked done by individual 'done' callbacks
+    // Safety net: mark any non-done jobs as error
+    const batchJobs = db
+      .prepare("SELECT id, status FROM jobs WHERE batch_id = ? ORDER BY id")
+      .all(batch_key);
+    for (const j of batchJobs) {
+      if (j.status !== "done") {
+        updateJob(j.id, { status: "error", error: "No output received from VPS automation" });
+      }
+    }
+    console.log(`[VPS] Batch ${batch_key} complete: ${completed.length}/${total} succeeded`);
+    releaseBatchAfterVps(batch_key);
+    return;
+  }
+
+  // Error case — find uncompleted jobs
+  const allBatchJobs = db
+    .prepare("SELECT id, status, retry_count FROM jobs WHERE batch_id = ? ORDER BY id")
+    .all(batch_key);
+  const failedJobs = allBatchJobs.filter((j) => j.status !== "done");
+
+  if (failedJobs.length === 0) {
+    console.log(`[VPS] Batch ${batch_key} error but all jobs succeeded`);
+    releaseBatchAfterVps(batch_key);
+    return;
+  }
+
+  // Rate limited — mark account, return jobs to pending, try another account
+  const isRateLimit = error === "RATE_LIMITED";
+  if (isRateLimit) {
+    if (accountId) markAccountRateLimited(accountId);
+    batch.accountId = null;
+
+    for (const j of failedJobs) {
+      updateJob(j.id, { status: "pending", error: null, account_id: null });
+      if (!batch.jobs.includes(j.id)) batch.jobs.push(j.id);
+    }
+
+    batch.processing = false;
+    scheduleWaiting();
+    setTimeout(() => startBatch(batch_key), 500);
+    return;
+  }
+
+  // Other error — retry entire batch
+  const currentRetry = Math.max(...allBatchJobs.map((j) => j.retry_count || 0));
+  const next = currentRetry + 1;
+
+  if (next > MAX_BATCH_RETRIES) {
+    console.error(`[VPS] Batch ${batch_key} max retries (${MAX_BATCH_RETRIES}). Marking ${failedJobs.length} jobs as error.`);
+    for (const j of failedJobs) {
+      updateJob(j.id, { status: "error", error: `Batch failed after ${MAX_BATCH_RETRIES} retries: ${error}`, retry_count: next });
+    }
+    releaseBatchAfterVps(batch_key);
+    return;
+  }
+
+  console.warn(`[VPS] Batch ${batch_key} retry ${next}/${MAX_BATCH_RETRIES} in ${RETRY_DELAY_SEC}s`);
+
+  // Reset ALL jobs for replay (conversation must be complete)
+  const allIds = allBatchJobs.map((j) => j.id);
+  for (const id of allIds) {
+    updateJob(id, { status: "pending", error, retry_count: next, mockup_image: null });
+  }
+
+  if (accountId) {
+    scheduleCooldown(accountId);
+    batch.accountId = null;
+  }
+
+  batch.processing = false;
+  pendingRetries.set(batch_key, (pendingRetries.get(batch_key) || 0) + 1);
+  setTimeout(() => {
+    pendingRetries.set(batch_key, (pendingRetries.get(batch_key) || 1) - 1);
+    for (const id of allIds) {
+      if (!batch.jobs.includes(id)) batch.jobs.push(id);
+    }
+    startBatch(batch_key);
+  }, RETRY_DELAY_SEC * 1000);
+}
+
+function releaseBatchAfterVps(batchKey) {
+  const batch = batches.get(batchKey);
+  if (!batch) return;
+
+  batch.processing = false;
+
+  if (batch.jobs.length === 0 && (pendingRetries.get(batchKey) || 0) === 0) {
+    if (batch.accountId) {
+      console.log(`[VPS] Batch ${batchKey} done, releasing account #${batch.accountId}`);
+      scheduleCooldown(batch.accountId);
+    }
+    batches.delete(batchKey);
+    pendingRetries.delete(batchKey);
+  } else {
+    setTimeout(() => startBatch(batchKey), 200);
+  }
+}
+
 // ── Startup: reset stuck accounts & re-queue pending jobs ───
 
 function resetStuckAccounts() {
@@ -668,4 +1146,4 @@ function resetStuckAccounts() {
 }
 resetStuckAccounts();
 
-module.exports = { enqueueJob };
+module.exports = { enqueueJob, handleVpsCallback };

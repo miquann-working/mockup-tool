@@ -118,6 +118,33 @@ try {
 } catch (e) {
   // column already exists – ignore
 }
+// ── Migration: add vps_nodes table ─────
+db.exec(`
+  CREATE TABLE IF NOT EXISTS vps_nodes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    host TEXT NOT NULL,
+    port INTEGER NOT NULL DEFAULT 5001,
+    secret_key TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'offline' CHECK(status IN ('online','offline','error')),
+    max_concurrent INTEGER NOT NULL DEFAULT 3,
+    last_heartbeat TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+  );
+`);
+// ── Migration: add vps_id to gemini_accounts ─────
+try {
+  db.exec(`ALTER TABLE gemini_accounts ADD COLUMN vps_id INTEGER REFERENCES vps_nodes(id)`);
+} catch (e) {
+  // column already exists – ignore
+}
+// ── Migration: add vps_id to users ─────
+try {
+  db.exec(`ALTER TABLE users ADD COLUMN vps_id INTEGER REFERENCES vps_nodes(id)`);
+} catch (e) {
+  // column already exists – ignore
+}
+
 // ── Migration: recreate users table to update CHECK constraint & rename roles ─────
 try {
   const hasOldCheck = db.prepare(

@@ -12,6 +12,7 @@ const promptGroupRoutes = require("./routes/prompt-groups");
 const accountRoutes = require("./routes/accounts");
 const jobRoutes = require("./routes/jobs");
 const settingRoutes = require("./routes/settings");
+const vpsRoutes = require("./routes/vps");
 
 const app = express();
 const PORT = process.env.PORT || 4000;
@@ -40,7 +41,7 @@ const swaggerSpec = swaggerJsdoc({
 });
 
 app.use(cors({ origin: true, credentials: true }));
-app.use(express.json());
+app.use(express.json({ limit: "50mb" }));
 
 // Swagger UI
 app.use("/api-docs", swaggerUi.serve, swaggerUi.setup(swaggerSpec));
@@ -57,6 +58,7 @@ app.use("/api/prompt-groups", promptGroupRoutes);
 app.use("/api/accounts", accountRoutes);
 app.use("/api/jobs", jobRoutes);
 app.use("/api/settings", settingRoutes);
+app.use("/api/vps", vpsRoutes);
 
 // Health check
 app.get("/api/health", (_req, res) => res.json({ ok: true }));

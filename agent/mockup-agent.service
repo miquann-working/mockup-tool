@@ -1,0 +1,14 @@
+[Unit]
+Description=Mockup VPS Agent
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/mockup-tool/agent
+ExecStart=/usr/bin/node server.js
+Restart=always
+RestartSec=5
+EnvironmentFile=/opt/mockup-tool/agent/.env
+
+[Install]
+WantedBy=multi-user.target
