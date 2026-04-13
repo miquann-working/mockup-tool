@@ -14,10 +14,10 @@ const CHECK_SCRIPT = path.resolve(__dirname, "../../../automation/check_session.
 const SETUP_SCRIPT = path.resolve(__dirname, "../../../automation/setup_account.py");
 const COOKIES_DIR = path.resolve(__dirname, "../../../cookies");
 
-// Multer for zip upload (max 50MB)
+// Multer for zip upload (max 200MB)
 const uploadZip = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 50 * 1024 * 1024 },
+  limits: { fileSize: 200 * 1024 * 1024 },
   fileFilter: (_req, file, cb) => {
     if (file.mimetype === "application/zip" || file.mimetype === "application/x-zip-compressed" || /\.zip$/i.test(file.originalname)) {
       cb(null, true);
@@ -276,7 +276,34 @@ router.post("/upload", authMiddleware, adminOnly, uploadZip.single("cookies"), (
     // Create target dir
     fs.mkdirSync(cookieDir, { recursive: true });
 
-    // Extract entries
+    // Skip browser cache folders that are large and unnecessary
+    const SKIP_PATTERNS = [
+      /^Cache\//i,
+      /^Code Cache\//i,
+      /^GPUCache\//i,
+      /^DawnWebGPUCache\//i,
+      /^DawnGraphiteCache\//i,
+      /^GrShaderCache\//i,
+      /^GraphiteDawnCache\//i,
+      /^ShaderCache\//i,
+      /^BrowserMetrics\//i,
+      /^DeferredBrowserMetrics\//i,
+      /^Crashpad\//i,
+      /^Safe Browsing\//i,
+      /^component_crx_cache\//i,
+      /^extensions_crx_cache\//i,
+      /^segmentation_platform\//i,
+      /^Default\/Cache\//i,
+      /^Default\/Code Cache\//i,
+      /^Default\/GPUCache\//i,
+      /^Default\/DawnWebGPUCache\//i,
+      /^Default\/DawnGraphiteCache\//i,
+      /^Default\/Service Worker\//i,
+    ];
+
+    // Extract entries (skip cache)
+    let extracted = 0;
+    let skipped = 0;
     for (const entry of entries) {
       if (entry.isDirectory) continue;
       let targetPath = entry.entryName;
@@ -285,13 +312,22 @@ router.post("/upload", authMiddleware, adminOnly, uploadZip.single("cookies"), (
       }
       if (!targetPath) continue;
 
+      // Skip cache folders
+      if (SKIP_PATTERNS.some((p) => p.test(targetPath))) {
+        skipped++;
+        continue;
+      }
+
       const fullPath = path.join(cookieDir, targetPath);
       // Security: prevent path traversal
       if (!fullPath.startsWith(cookieDir)) continue;
 
       fs.mkdirSync(path.dirname(fullPath), { recursive: true });
       fs.writeFileSync(fullPath, entry.getData());
+      extracted++;
     }
+
+    console.log(`[Upload cookies] ${email}: ${extracted} files extracted, ${skipped} cache files skipped`);
 
     // Create or update account in DB
     const existing = db.prepare("SELECT id FROM gemini_accounts WHERE email = ?").get(email);
