@@ -49,30 +49,32 @@ def setup_account(email):
         browser = p.chromium.launch_persistent_context(
             user_data_dir=cookie_dir,
             headless=False,
+            channel="chrome",
+            ignore_default_args=["--enable-automation"],
             args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--disable-infobars",
                 "--password-store=basic",
+                "--disable-blink-features=AutomationControlled",
                 "--window-position=100,100",
             ],
-            viewport={"width": 1280, "height": 900},
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            viewport=None,
             locale="vi-VN",
             timezone_id="Asia/Ho_Chi_Minh",
         )
 
+        # Hide webdriver property
         browser.add_init_script("""
             Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-            if (!window.chrome) {
-                window.chrome = { runtime: {}, csi: function(){}, loadTimes: function(){} };
-            }
         """)
 
         page = browser.pages[0] if browser.pages else browser.new_page()
         for extra in browser.pages[1:]:
             extra.close()
 
+        # Warm up: visit Google first to establish cookies before Gemini
+        page.goto("https://www.google.com/", wait_until="domcontentloaded", timeout=15000)
+        time.sleep(2)
+        page.goto("https://accounts.google.com/", wait_until="domcontentloaded", timeout=15000)
+        time.sleep(2)
         page.goto("https://gemini.google.com/", wait_until="domcontentloaded", timeout=30000)
 
         # Auto-detect: poll until we land on gemini.google.com/app (logged in)

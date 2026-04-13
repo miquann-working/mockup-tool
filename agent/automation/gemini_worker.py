@@ -214,6 +214,7 @@ def main():
         browser = p.chromium.launch_persistent_context(
             user_data_dir=COOKIE_DIR,
             headless=_headless,
+            ignore_default_args=["--enable-automation"],
             args=[
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
@@ -420,6 +421,7 @@ def _launch_browser(p):
     browser = p.chromium.launch_persistent_context(
         user_data_dir=COOKIE_DIR,
         headless=_headless,
+        ignore_default_args=["--enable-automation"],
         args=[
             "--disable-blink-features=AutomationControlled",
             "--no-sandbox",
