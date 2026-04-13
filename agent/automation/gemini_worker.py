@@ -182,15 +182,17 @@ def main():
     with sync_playwright() as p:
         _cleanup_chrome_lock(COOKIE_DIR)
         _extra_args = []
+        _headless = False
         if HEADLESS:
             _extra_args.append("--headless=new")
+            _headless = True
         else:
             _extra_args.append("--window-position=-9999,-9999")
         import tempfile as _tempfile
         _cache_dir = _tempfile.mkdtemp(prefix="chromium_cache_")
         browser = p.chromium.launch_persistent_context(
             user_data_dir=COOKIE_DIR,
-            headless=False,
+            headless=_headless,
             args=[
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
@@ -379,15 +381,17 @@ def _launch_browser(p):
     """Launch persistent Chromium browser and return (browser, page)."""
     _cleanup_chrome_lock(COOKIE_DIR)
     _extra_args = []
+    _headless = False
     if HEADLESS:
         _extra_args.append("--headless=new")
+        _headless = True
     else:
         _extra_args.append("--window-position=-9999,-9999")
     import tempfile as _tempfile
     _cache_dir = _tempfile.mkdtemp(prefix="chromium_cache_")
     browser = p.chromium.launch_persistent_context(
         user_data_dir=COOKIE_DIR,
-        headless=False,
+        headless=_headless,
         args=[
             "--disable-blink-features=AutomationControlled",
             "--no-sandbox",
