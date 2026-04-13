@@ -1024,8 +1024,8 @@ def _click_create_image(page):
             if any(t in text or t in aria for t in target_terms):
                 if btn.is_visible():
                     box = btn.bounding_box()
-                    if box and box['x'] < sidebar_x:
-                        continue  # Skip sidebar buttons
+                    if box and box['x'] < sidebar_x and box['y'] < 200:
+                        continue  # Skip sidebar buttons (top-left area only)
                     log(f"  Found 'Tạo hình ảnh' button")
                     btn.click()
                     time.sleep(1.0)
