@@ -182,19 +182,30 @@ export default function AdminAccountsPage() {
     }
   };
 
-  const handleUploadCookie = async () => {
+    const handleUploadCookie = async () => {
     if (!email.trim() || !cookieFile) return;
     setUploading(true);
     try {
       const fd = new FormData();
       fd.append("email", email.trim());
       fd.append("cookies", cookieFile);
-      await api.post("/accounts/upload", fd);
+      // Upload trực tiếp tới backend (bypass Next.js proxy 10MB limit)
+      const token = localStorage.getItem("token");
+      const backendUrl = window.location.protocol + "//" + window.location.hostname + ":4000";
+      const resp = await fetch(backendUrl + "/api/accounts/upload", {
+        method: "POST",
+        headers: { Authorization: "Bearer " + (token || "") },
+        body: fd,
+      });
+      if (!resp.ok) {
+        const data = await resp.json().catch(() => ({}));
+        throw new Error(data.error || "Upload thất bại");
+      }
       closeModal();
       fetchAccounts();
     } catch (err: unknown) {
-      const axiosErr = err as { response?: { data?: { error?: string } } };
-      alert(axiosErr.response?.data?.error || "Upload thất bại");
+      const e = err as Error;
+      alert(e.message || "Upload thất bại");
     } finally {
       setUploading(false);
     }
