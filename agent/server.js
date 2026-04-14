@@ -97,6 +97,32 @@ function log(msg) {
   console.log(`[${ts}] ${msg}`);
 }
 
+/** Auto-sync a single cookie dir from main server if missing locally. */
+async function autoSyncCookie(email) {
+  const targetDir = path.join(COOKIES_DIR, email);
+  if (fs.existsSync(targetDir)) return true;
+  log(`[AutoSync] ${email} not found locally, pulling from server...`);
+  try {
+    const tarUrl = `${SERVER_URL}/api/vps/cookies-tar/${encodeURIComponent(email)}`;
+    const fetchRes = await fetch(tarUrl, {
+      headers: { "X-Api-Key": SECRET_KEY },
+      signal: AbortSignal.timeout(2 * 60_000),
+    });
+    if (!fetchRes.ok) {
+      log(`[AutoSync] ${email} failed: HTTP ${fetchRes.status}`);
+      return false;
+    }
+    const nodeStream = require("stream").Readable.fromWeb(fetchRes.body);
+    await pipeline(nodeStream, tar.extract({ cwd: COOKIES_DIR }));
+    const ok = fs.existsSync(targetDir);
+    log(`[AutoSync] ${email}: ${ok ? "OK" : "extract failed"}`);
+    return ok;
+  } catch (err) {
+    log(`[AutoSync] ${email} error: ${err.message}`);
+    return false;
+  }
+}
+
 // ── Routes: Health & Status ─────────────────────────────────
 
 app.get("/agent/health", (_req, res) => {
@@ -195,7 +221,7 @@ app.get("/agent/outputs/:filename", auth, (req, res) => {
 
 // ── Routes: Execute single job ──────────────────────────────
 
-app.post("/agent/execute", auth, upload.single("image"), (req, res) => {
+app.post("/agent/execute", auth, upload.single("image"), async (req, res) => {
   if (activeWorkers >= MAX_CONCURRENT) {
     cleanupFile(req.file);
     return res.status(503).json({ error: "Agent busy", active: activeWorkers, max: MAX_CONCURRENT });
@@ -213,8 +239,11 @@ app.post("/agent/execute", auth, upload.single("image"), (req, res) => {
 
   const cookiePath = path.join(COOKIES_DIR, path.basename(cookie_dir));
   if (!fs.existsSync(cookiePath)) {
-    cleanupFile(req.file);
-    return res.status(400).json({ error: `Cookie dir not found: ${cookie_dir}` });
+    const synced = await autoSyncCookie(path.basename(cookie_dir));
+    if (!synced) {
+      cleanupFile(req.file);
+      return res.status(400).json({ error: `Cookie dir not found: ${cookie_dir}` });
+    }
   }
 
   activeWorkers++;
@@ -273,7 +302,7 @@ async function executeSingleJob(params) {
 
 // ── Routes: Execute batch ───────────────────────────────────
 
-app.post("/agent/execute-batch", auth, upload.single("image"), (req, res) => {
+app.post("/agent/execute-batch", auth, upload.single("image"), async (req, res) => {
   if (activeWorkers >= MAX_CONCURRENT) {
     cleanupFile(req.file);
     return res.status(503).json({ error: "Agent busy", active: activeWorkers, max: MAX_CONCURRENT });
@@ -291,8 +320,11 @@ app.post("/agent/execute-batch", auth, upload.single("image"), (req, res) => {
 
   const cookiePath = path.join(COOKIES_DIR, path.basename(cookie_dir));
   if (!fs.existsSync(cookiePath)) {
-    cleanupFile(req.file);
-    return res.status(400).json({ error: `Cookie dir not found: ${cookie_dir}` });
+    const synced = await autoSyncCookie(path.basename(cookie_dir));
+    if (!synced) {
+      cleanupFile(req.file);
+      return res.status(400).json({ error: `Cookie dir not found: ${cookie_dir}` });
+    }
   }
 
   let jobIdList;

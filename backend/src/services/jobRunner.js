@@ -215,11 +215,30 @@ function getVpsNode(vpsId) {
 /** Build base URL for a VPS node.
  *  If host starts with http(s), treat as full URL (Cloudflare Tunnel, etc.).
  *  Otherwise build http://host:port. */
-function getAgentBaseUrl(node) {
-  if (node.host.startsWith("http://") || node.host.startsWith("https://")) {
-    return node.host.replace(/\/+$/, ""); // strip trailing slash
+/** Sync cookie dir from main server to VPS agent before dispatch.
+ *  Returns true if sync succeeded or was unnecessary. */
+async function syncCookiesToVps(vpsNode, cookieDir) {
+  const email = path.basename(cookieDir);
+  const baseUrl = getAgentBaseUrl(vpsNode);
+  try {
+    const res = await fetch(`${baseUrl}/agent/cookies/sync`, {
+      method: "POST",
+      headers: { "X-Api-Key": vpsNode.secret_key, "Content-Type": "application/json" },
+      body: JSON.stringify({ emails: [email] }),
+      signal: AbortSignal.timeout(120_000),
+    });
+    if (!res.ok) {
+      console.warn(`[CookieSync] ${email} → ${vpsNode.name}: HTTP ${res.status}`);
+      return false;
+    }
+    const data = await res.json();
+    const ok = data.results?.[email]?.ok ?? false;
+    console.log(`[CookieSync] ${email} → ${vpsNode.name}: ${ok ? "OK" : "FAIL"}`);
+    return ok;
+  } catch (err) {
+    console.warn(`[CookieSync] ${email} → ${vpsNode.name}: ${err.message}`);
+    return false;
   }
-  return `http://${node.host}:${node.port}`;
 }
 
 async function dispatchSingleToVps(vpsNode, params) {
@@ -513,6 +532,7 @@ async function processBatchJobs(jobIds, accountId, batchKey) {
 
     try {
       const jobIdsForVps = jobDataList.map((d) => d.job.id);
+      await syncCookiesToVps(vpsNode, account.cookie_dir);
       await dispatchBatchToVps(vpsNode, {
         cookieDir: account.cookie_dir,
         imagePath: path.resolve(__dirname, "../../../uploads", jobDataList[0].job.original_image),
@@ -770,6 +790,7 @@ async function processJob(jobId, accountId) {
 
     const batchKey = getBatchKey(jobId);
     try {
+      await syncCookiesToVps(vpsNode, account.cookie_dir);
       await dispatchSingleToVps(vpsNode, {
         jobId,
         cookieDir: account.cookie_dir,

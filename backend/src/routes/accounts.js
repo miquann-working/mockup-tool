@@ -417,6 +417,24 @@ router.post("/setup-login", authMiddleware, adminOnly, (req, res) => {
         sanitizedEmail
       );
       console.log(`[setup-login] Account ${sanitizedEmail} → free`);
+
+      // Auto-sync cookies to assigned VPS (if any)
+      const account = db.prepare("SELECT vps_id FROM gemini_accounts WHERE email = ?").get(sanitizedEmail);
+      if (account?.vps_id) {
+        const vpsNode = db.prepare("SELECT * FROM vps_nodes WHERE id = ?").get(account.vps_id);
+        if (vpsNode) {
+          const baseUrl = vpsNode.host.startsWith("http") ? vpsNode.host.replace(/\/+$/, "") : `http://${vpsNode.host}:${vpsNode.port}`;
+          fetch(`${baseUrl}/agent/cookies/sync`, {
+            method: "POST",
+            headers: { "X-Api-Key": vpsNode.secret_key, "Content-Type": "application/json" },
+            body: JSON.stringify({ emails: [sanitizedEmail] }),
+            signal: AbortSignal.timeout(120_000),
+          })
+            .then((r) => r.json())
+            .then((data) => console.log(`[setup-login] Cookie sync to ${vpsNode.name}: ${JSON.stringify(data.results)}`))
+            .catch((err) => console.warn(`[setup-login] Cookie sync failed: ${err.message}`));
+        }
+      }
     } else {
       console.error(`[setup-login] Failed for ${sanitizedEmail}: ${stderr || stdout}`);
       // Keep as disabled so user can see it failed
