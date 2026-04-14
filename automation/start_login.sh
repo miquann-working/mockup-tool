@@ -17,8 +17,29 @@ VNC_PORT=5900
 NOVNC_PORT=6080
 DISPLAY_NUM=:99
 
-# Ensure cookie dir exists
-mkdir -p "$COOKIE_DIR"
+# Ensure cookie dir exists — start fresh to avoid corrupted profile
+if [ -d "$COOKIE_DIR/Default" ]; then
+    echo "Resetting browser profile (keeping exported_cookies.json)..."
+    # Backup exported cookies if exists
+    if [ -f "$COOKIE_DIR/exported_cookies.json" ]; then
+        cp "$COOKIE_DIR/exported_cookies.json" /tmp/exported_cookies_backup.json
+    fi
+    if [ -f "$COOKIE_DIR/cookie_platform.txt" ]; then
+        cp "$COOKIE_DIR/cookie_platform.txt" /tmp/cookie_platform_backup.txt
+    fi
+    # Remove old profile
+    rm -rf "$COOKIE_DIR"
+    mkdir -p "$COOKIE_DIR"
+    # Restore backups
+    if [ -f /tmp/exported_cookies_backup.json ]; then
+        mv /tmp/exported_cookies_backup.json "$COOKIE_DIR/exported_cookies.json"
+    fi
+    if [ -f /tmp/cookie_platform_backup.txt ]; then
+        mv /tmp/cookie_platform_backup.txt "$COOKIE_DIR/cookie_platform.txt"
+    fi
+else
+    mkdir -p "$COOKIE_DIR"
+fi
 
 # Kill any existing x11vnc / novnc / chromium
 pkill -f "x11vnc.*$VNC_PORT" 2>/dev/null || true
