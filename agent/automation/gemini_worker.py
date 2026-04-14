@@ -171,6 +171,32 @@ def _import_exported_cookies(browser, cookie_dir):
         log(f"Warning: could not import exported cookies: {e}")
 
 
+def _clear_encrypted_cookies(cookie_dir):
+    """Remove Chromium's encrypted cookie files before launch.
+
+    When cookie profile was created on Windows (DPAPI encryption),
+    Linux Chromium cannot decrypt them. Removing these files forces
+    Chromium to start with a clean cookie jar, then we inject
+    plaintext cookies via _import_exported_cookies() after launch.
+    Only clears if exported_cookies.json exists (= cross-platform scenario).
+    """
+    json_path = os.path.join(cookie_dir, "exported_cookies.json")
+    if not os.path.isfile(json_path):
+        return  # no JSON = local cookies, don't touch
+
+    targets = [
+        os.path.join(cookie_dir, "Default", "Cookies"),
+        os.path.join(cookie_dir, "Default", "Cookies-journal"),
+    ]
+    for f in targets:
+        try:
+            if os.path.isfile(f):
+                os.remove(f)
+                log(f"  Cleared encrypted cookie file: {os.path.basename(f)}")
+        except Exception:
+            pass
+
+
 def main():
     if JOBS_JSON:
         return main_batch()
@@ -202,6 +228,7 @@ def main():
 
     with sync_playwright() as p:
         _cleanup_chrome_lock(COOKIE_DIR)
+        _clear_encrypted_cookies(COOKIE_DIR)
         _extra_args = []
         _headless = False
         if HEADLESS:
@@ -409,6 +436,7 @@ def _cleanup_chrome_lock(cookie_dir):
 def _launch_browser(p):
     """Launch persistent Chromium browser and return (browser, page)."""
     _cleanup_chrome_lock(COOKIE_DIR)
+    _clear_encrypted_cookies(COOKIE_DIR)
     _extra_args = []
     _headless = False
     if HEADLESS:

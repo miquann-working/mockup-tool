@@ -150,6 +150,28 @@ def _selector_fail_screenshot(page, func_name, context=""):
         pass
 
 
+def _clear_encrypted_cookies(cookie_dir):
+    """Delete Chromium encrypted cookie files before launch.
+
+    When a cookie profile was created on Windows (DPAPI encryption) and is
+    used on Linux, Chromium cannot decrypt the SQLite cookie store.  If an
+    exported_cookies.json exists (plaintext), we remove the encrypted DB
+    so that Chromium starts with an empty cookie jar and the plaintext
+    cookies injected via Playwright API will be the only ones present.
+    """
+    json_path = os.path.join(cookie_dir, "exported_cookies.json")
+    if not os.path.isfile(json_path):
+        return  # No exported cookies → keep original DB
+    for fname in ("Default/Cookies", "Default/Cookies-journal"):
+        fpath = os.path.join(cookie_dir, fname)
+        if os.path.isfile(fpath):
+            try:
+                os.remove(fpath)
+                log(f"Removed encrypted cookie file: {fpath}")
+            except Exception as e:
+                log(f"Warning: could not remove {fpath}: {e}")
+
+
 def _import_exported_cookies(browser, cookie_dir):
     """Import plaintext cookies from exported_cookies.json if present.
 
@@ -202,6 +224,7 @@ def main():
 
     with sync_playwright() as p:
         _cleanup_chrome_lock(COOKIE_DIR)
+        _clear_encrypted_cookies(COOKIE_DIR)
         # --headless=new: Chromium's new headless renders identically to headed mode
         # We set Playwright headless=False and pass the flag manually to avoid
         # Playwright's old headless shell which is easily detected.
@@ -433,6 +456,7 @@ def _cleanup_chrome_lock(cookie_dir):
 def _launch_browser(p):
     """Launch persistent Chromium browser and return (browser, page)."""
     _cleanup_chrome_lock(COOKIE_DIR)
+    _clear_encrypted_cookies(COOKIE_DIR)
     _extra_args = []
     _headless = False
     if HEADLESS:
