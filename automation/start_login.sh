@@ -46,20 +46,22 @@ fi
 websockify --web="$NOVNC_DIR" $NOVNC_PORT localhost:$VNC_PORT --daemon 2>/dev/null
 
 # Get Playwright Chromium path
-PW_CHROMIUM=$(/home/mockup/venv/bin/python3 -c "
+PW_CHROMIUM=$(find /home/mockup/.cache/ms-playwright -name "chrome" -path "*/chrome-linux*/chrome" -type f 2>/dev/null | head -1)
+
+if [ -z "$PW_CHROMIUM" ]; then
+    PW_CHROMIUM=$(/home/mockup/venv/bin/python3 -c "
 from playwright.sync_api import sync_playwright
 with sync_playwright() as p:
     print(p.chromium.executable_path)
 " 2>/dev/null)
-
-if [ -z "$PW_CHROMIUM" ]; then
-    PW_CHROMIUM=$(find /home/mockup/.cache/ms-playwright -name "chromium-*" -path "*/chrome-linux/chrome" 2>/dev/null | head -1)
 fi
 
 if [ -z "$PW_CHROMIUM" ]; then
-    echo "ERROR: Cannot find Playwright Chromium. Using system chromium."
-    PW_CHROMIUM="chromium-browser"
+    echo "ERROR: Cannot find Playwright Chromium!"
+    exit 1
 fi
+
+echo "Using Chromium: $PW_CHROMIUM"
 
 echo ""
 echo "╔══════════════════════════════════════════════════════════════╗"
@@ -84,8 +86,12 @@ $PW_CHROMIUM \
     --lang=vi-VN \
     --window-size=1280,900 \
     --window-position=0,0 \
+    --no-first-run \
+    --no-default-browser-check \
+    --disable-translate \
+    --disable-sync \
     "https://accounts.google.com/signin/v2/identifier?flowName=GlifWebSignIn&flowEntry=ServiceLogin&continue=https://gemini.google.com/app" \
-    2>/dev/null &
+    &
 
 CHROME_PID=$!
 echo "Chromium PID: $CHROME_PID"
