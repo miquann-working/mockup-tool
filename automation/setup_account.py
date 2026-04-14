@@ -49,7 +49,6 @@ def setup_account(email):
         browser = p.chromium.launch_persistent_context(
             user_data_dir=cookie_dir,
             headless=False,
-            channel="chrome",
             ignore_default_args=["--enable-automation"],
             args=[
                 "--password-store=basic",
