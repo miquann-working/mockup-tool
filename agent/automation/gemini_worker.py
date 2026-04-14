@@ -2029,6 +2029,7 @@ def _wait_for_response(page, resp_before=0):
     log("  Phase 1: Waiting for Gemini response element...")
     MAX_START_WAIT = 100
     thinking_logged = False
+    thinking_start = 0
 
     while time.time() - start < MAX_START_WAIT:
         elapsed = int(time.time() - start)
@@ -2083,8 +2084,19 @@ def _wait_for_response(page, resp_before=0):
             if not thinking_logged:
                 log(f"  Gemini is thinking/generating (detected at {elapsed}s), extending wait...")
                 thinking_logged = True
-            # Extend Phase 1 deadline since Gemini IS processing
-            MAX_START_WAIT = max(MAX_START_WAIT, elapsed + 120)
+                thinking_start = elapsed
+            # Extend Phase 1 deadline since Gemini IS processing, but cap at MAX_WAIT_SECS
+            MAX_START_WAIT = min(max(MAX_START_WAIT, elapsed + 120), MAX_WAIT_SECS)
+            # If thinking for too long without response element, likely stuck
+            if elapsed - thinking_start > 300:
+                log(f"  Thinking for {elapsed - thinking_start}s without response — likely stuck")
+                debug_path = os.path.join(OUTPUT_DIR, f"debug_stuck_{OUTPUT_PREFIX}.png")
+                try:
+                    page.screenshot(path=debug_path)
+                    log(f"  Debug screenshot: {debug_path}")
+                except Exception:
+                    pass
+                raise Exception(f"Gemini stuck in thinking state for {elapsed - thinking_start}s without producing response")
 
         if elapsed - last_log >= 10:
             log(f"    Waiting for response... ({elapsed}s)")
