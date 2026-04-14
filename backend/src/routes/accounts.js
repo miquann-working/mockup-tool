@@ -388,7 +388,7 @@ router.post("/setup-login", authMiddleware, adminOnly, (req, res) => {
     cwd: path.resolve(__dirname, "../../../"),
     timeout: 360_000, // 6 minutes max
     stdio: ["ignore", "pipe", "pipe"],
-    env: { ...process.env, PYTHONIOENCODING: "utf-8" },
+    env: { ...process.env, PYTHONIOENCODING: "utf-8", DISPLAY: process.env.DISPLAY || ":0" },
   });
 
   let stdout = "";
