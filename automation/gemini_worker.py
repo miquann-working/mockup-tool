@@ -153,29 +153,18 @@ def _selector_fail_screenshot(page, func_name, context=""):
 def _clear_encrypted_cookies(cookie_dir):
     """Remove Chromium's encrypted cookie files before launch.
 
-    Only needed for CROSS-PLATFORM scenarios (cookies created on Windows,
-    used on Linux). When both are the same OS with --password-store=basic,
-    the SQLite cookies are directly compatible and should NOT be cleared.
+    Always clear SQLite cookies when exported_cookies.json exists.
+    setup_account.py uses Google Chrome (channel='chrome') to create cookies,
+    but the worker uses Playwright's bundled Chromium. The SQLite cookie
+    store from Chrome is incompatible with Chromium and can cause race
+    conditions where Chromium's async SQLite load overwrites the cookies
+    injected via browser.add_cookies(). Rely solely on JSON import.
     """
     json_path = os.path.join(cookie_dir, "exported_cookies.json")
     if not os.path.isfile(json_path):
         return  # no JSON = local cookies, don't touch
 
-    # Check platform marker — only clear if cookies were created on a different OS
-    import platform as _platform
-    current_os = _platform.system()  # 'Linux', 'Windows', 'Darwin'
-    platform_file = os.path.join(cookie_dir, "cookie_platform.txt")
-    if os.path.isfile(platform_file):
-        try:
-            with open(platform_file, "r") as f:
-                source_os = f.read().strip()
-            if source_os == current_os:
-                log(f"  Cookies from same OS ({source_os}), keeping SQLite cookies")
-                return  # Same OS → SQLite cookies are compatible
-        except Exception:
-            pass  # Can't read marker → assume cross-platform, clear
-
-    log(f"  Cross-platform cookies detected, clearing encrypted SQLite cookies")
+    log("  Clearing SQLite cookies (worker uses Chromium, not Chrome that created them)")
     targets = [
         os.path.join(cookie_dir, "Default", "Cookies"),
         os.path.join(cookie_dir, "Default", "Cookies-journal"),
@@ -184,7 +173,7 @@ def _clear_encrypted_cookies(cookie_dir):
         try:
             if os.path.isfile(f):
                 os.remove(f)
-                log(f"  Cleared encrypted cookie file: {os.path.basename(f)}")
+                log(f"  Cleared cookie file: {os.path.basename(f)}")
         except Exception:
             pass
 
