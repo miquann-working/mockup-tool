@@ -473,6 +473,7 @@ function spawnWorker({ cookieDir, imagePath, promptText, outputPrefix, imageStyl
     const child = spawn(PYTHON, [SCRIPT], {
       env: {
         ...process.env,
+        HEADLESS: "1",
         COOKIE_DIR: cookieDir,
         IMAGE_PATH: imagePath,
         PROMPT_TEXT: promptText,
@@ -536,6 +537,7 @@ function spawnBatchWorker({ cookieDir, imagePath, imageStyle, skipImageTool, job
     const child = spawn(PYTHON, [SCRIPT], {
       env: {
         ...process.env,
+        HEADLESS: "1",
         COOKIE_DIR: cookieDir,
         IMAGE_PATH: imagePath,
         IMAGE_STYLE: imageStyle,
