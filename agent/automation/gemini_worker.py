@@ -174,16 +174,29 @@ def _import_exported_cookies(browser, cookie_dir):
 def _clear_encrypted_cookies(cookie_dir):
     """Remove Chromium's encrypted cookie files before launch.
 
-    When cookie profile was created on Windows (DPAPI encryption),
-    Linux Chromium cannot decrypt them. Removing these files forces
-    Chromium to start with a clean cookie jar, then we inject
-    plaintext cookies via _import_exported_cookies() after launch.
-    Only clears if exported_cookies.json exists (= cross-platform scenario).
+    Only needed for CROSS-PLATFORM scenarios (cookies created on Windows,
+    used on Linux). When both are the same OS with --password-store=basic,
+    the SQLite cookies are directly compatible and should NOT be cleared.
     """
     json_path = os.path.join(cookie_dir, "exported_cookies.json")
     if not os.path.isfile(json_path):
         return  # no JSON = local cookies, don't touch
 
+    # Check platform marker — only clear if cookies were created on a different OS
+    import platform as _platform
+    current_os = _platform.system()  # 'Linux', 'Windows', 'Darwin'
+    platform_file = os.path.join(cookie_dir, "cookie_platform.txt")
+    if os.path.isfile(platform_file):
+        try:
+            with open(platform_file, "r") as f:
+                source_os = f.read().strip()
+            if source_os == current_os:
+                log(f"  Cookies from same OS ({source_os}), keeping SQLite cookies")
+                return  # Same OS → SQLite cookies are compatible
+        except Exception:
+            pass  # Can't read marker → assume cross-platform, clear
+
+    log(f"  Cross-platform cookies detected, clearing encrypted SQLite cookies")
     targets = [
         os.path.join(cookie_dir, "Default", "Cookies"),
         os.path.join(cookie_dir, "Default", "Cookies-journal"),

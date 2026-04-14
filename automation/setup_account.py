@@ -116,6 +116,14 @@ def setup_account(email):
         except Exception as e:
             print(f"Warning: could not export cookies JSON: {e}")
 
+        # Save platform marker so agents know if cross-platform clearing is needed
+        import platform as _platform
+        try:
+            with open(os.path.join(cookie_dir, "cookie_platform.txt"), "w") as f:
+                f.write(_platform.system())
+        except Exception:
+            pass
+
         browser.close()
 
     return cookie_dir

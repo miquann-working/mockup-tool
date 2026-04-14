@@ -151,25 +151,42 @@ def _selector_fail_screenshot(page, func_name, context=""):
 
 
 def _clear_encrypted_cookies(cookie_dir):
-    """Delete Chromium encrypted cookie files before launch.
+    """Remove Chromium's encrypted cookie files before launch.
 
-    When a cookie profile was created on Windows (DPAPI encryption) and is
-    used on Linux, Chromium cannot decrypt the SQLite cookie store.  If an
-    exported_cookies.json exists (plaintext), we remove the encrypted DB
-    so that Chromium starts with an empty cookie jar and the plaintext
-    cookies injected via Playwright API will be the only ones present.
+    Only needed for CROSS-PLATFORM scenarios (cookies created on Windows,
+    used on Linux). When both are the same OS with --password-store=basic,
+    the SQLite cookies are directly compatible and should NOT be cleared.
     """
     json_path = os.path.join(cookie_dir, "exported_cookies.json")
     if not os.path.isfile(json_path):
-        return  # No exported cookies → keep original DB
-    for fname in ("Default/Cookies", "Default/Cookies-journal"):
-        fpath = os.path.join(cookie_dir, fname)
-        if os.path.isfile(fpath):
-            try:
-                os.remove(fpath)
-                log(f"Removed encrypted cookie file: {fpath}")
-            except Exception as e:
-                log(f"Warning: could not remove {fpath}: {e}")
+        return  # no JSON = local cookies, don't touch
+
+    # Check platform marker — only clear if cookies were created on a different OS
+    import platform as _platform
+    current_os = _platform.system()  # 'Linux', 'Windows', 'Darwin'
+    platform_file = os.path.join(cookie_dir, "cookie_platform.txt")
+    if os.path.isfile(platform_file):
+        try:
+            with open(platform_file, "r") as f:
+                source_os = f.read().strip()
+            if source_os == current_os:
+                log(f"  Cookies from same OS ({source_os}), keeping SQLite cookies")
+                return  # Same OS → SQLite cookies are compatible
+        except Exception:
+            pass  # Can't read marker → assume cross-platform, clear
+
+    log(f"  Cross-platform cookies detected, clearing encrypted SQLite cookies")
+    targets = [
+        os.path.join(cookie_dir, "Default", "Cookies"),
+        os.path.join(cookie_dir, "Default", "Cookies-journal"),
+    ]
+    for f in targets:
+        try:
+            if os.path.isfile(f):
+                os.remove(f)
+                log(f"  Cleared encrypted cookie file: {os.path.basename(f)}")
+        except Exception:
+            pass
 
 
 def _import_exported_cookies(browser, cookie_dir):
