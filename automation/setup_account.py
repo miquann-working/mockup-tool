@@ -61,70 +61,87 @@ def setup_account(email):
             timezone_id="Asia/Ho_Chi_Minh",
         )
 
-        # Hide webdriver property
-        browser.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-        """)
+        try:
+            # Hide webdriver property
+            browser.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            """)
 
-        page = browser.pages[0] if browser.pages else browser.new_page()
-        for extra in browser.pages[1:]:
-            extra.close()
+            page = browser.pages[0] if browser.pages else browser.new_page()
+            for extra in browser.pages[1:]:
+                extra.close()
 
-        # Warm up: visit Google first to establish cookies before Gemini
-        page.goto("https://www.google.com/", wait_until="domcontentloaded", timeout=15000)
-        time.sleep(2)
-        page.goto("https://accounts.google.com/", wait_until="domcontentloaded", timeout=15000)
-        time.sleep(2)
-        page.goto("https://gemini.google.com/", wait_until="domcontentloaded", timeout=30000)
-
-        # Auto-detect: poll until we land on gemini.google.com/app (logged in)
-        max_wait = 300  # 5 minutes
-        start = time.time()
-        logged_in = False
-
-        while time.time() - start < max_wait:
+            # Warm up: visit Google first to establish cookies before Gemini
+            print("[setup] Navigating to google.com...", flush=True)
             try:
-                url = page.url
-                if "gemini.google.com/app" in url or "gemini.google.com/gem" in url:
-                    if "accounts.google.com" not in url and "signin" not in url:
-                        time.sleep(2)
-                        logged_in = True
-                        break
+                page.goto("https://www.google.com/", wait_until="domcontentloaded", timeout=15000)
+            except Exception as e:
+                print(f"[setup] google.com nav warning: {e}", flush=True)
+            time.sleep(2)
+
+            print("[setup] Navigating to accounts.google.com...", flush=True)
+            try:
+                page.goto("https://accounts.google.com/", wait_until="domcontentloaded", timeout=15000)
+            except Exception as e:
+                print(f"[setup] accounts.google.com nav warning: {e}", flush=True)
+            time.sleep(2)
+
+            print("[setup] Navigating to gemini.google.com...", flush=True)
+            try:
+                page.goto("https://gemini.google.com/", wait_until="domcontentloaded", timeout=30000)
+            except Exception as e:
+                print(f"[setup] gemini.google.com nav warning: {e}", flush=True)
+
+            # Auto-detect: poll until we land on gemini.google.com/app (logged in)
+            max_wait = 300  # 5 minutes
+            start = time.time()
+            logged_in = False
+
+            print(f"[setup] Polling for login (url={page.url})...", flush=True)
+            while time.time() - start < max_wait:
+                try:
+                    url = page.url
+                    if "gemini.google.com/app" in url or "gemini.google.com/gem" in url:
+                        if "accounts.google.com" not in url and "signin" not in url:
+                            time.sleep(2)
+                            logged_in = True
+                            break
+                except Exception:
+                    pass
+                time.sleep(1)
+
+            if not logged_in:
+                print("\n[setup] Timeout (5 min). Closing browser...", flush=True)
+                return None
+
+            print(f"[setup] Login successful!", flush=True)
+
+            # Export cookies as plaintext JSON for cross-platform portability
+            try:
+                cookies = browser.cookies()
+                cookies_json_path = os.path.join(cookie_dir, "exported_cookies.json")
+                with open(cookies_json_path, "w", encoding="utf-8") as f:
+                    json.dump(cookies, f)
+                print(f"[setup] Exported {len(cookies)} cookies to exported_cookies.json", flush=True)
+            except Exception as e:
+                print(f"[setup] Warning: could not export cookies JSON: {e}", flush=True)
+
+            # Save platform marker so agents know if cross-platform clearing is needed
+            import platform as _platform
+            try:
+                with open(os.path.join(cookie_dir, "cookie_platform.txt"), "w") as f:
+                    f.write(_platform.system())
+                print(f"[setup] Platform marker: {_platform.system()}", flush=True)
             except Exception:
                 pass
-            time.sleep(1)
 
-        if not logged_in:
-            print("\nTimeout (5 min). Closing browser...")
+        finally:
+            print("[setup] Closing browser...", flush=True)
             try:
                 browser.close()
             except Exception:
                 pass
-            return None
-
-        print(f"\nLogin successful!")
-
-        # Export cookies as plaintext JSON for cross-platform portability
-        # (Chromium encrypts cookies differently on Windows vs Linux,
-        #  so we save decrypted cookies via Playwright API)
-        try:
-            cookies = browser.cookies()
-            cookies_json_path = os.path.join(cookie_dir, "exported_cookies.json")
-            with open(cookies_json_path, "w", encoding="utf-8") as f:
-                json.dump(cookies, f)
-            print(f"Exported {len(cookies)} cookies to exported_cookies.json")
-        except Exception as e:
-            print(f"Warning: could not export cookies JSON: {e}")
-
-        # Save platform marker so agents know if cross-platform clearing is needed
-        import platform as _platform
-        try:
-            with open(os.path.join(cookie_dir, "cookie_platform.txt"), "w") as f:
-                f.write(_platform.system())
-        except Exception:
-            pass
-
-        browser.close()
+            print("[setup] Browser closed.", flush=True)
 
     return cookie_dir
 
