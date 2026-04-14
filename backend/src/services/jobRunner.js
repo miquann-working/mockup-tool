@@ -215,6 +215,13 @@ function getVpsNode(vpsId) {
 /** Build base URL for a VPS node.
  *  If host starts with http(s), treat as full URL (Cloudflare Tunnel, etc.).
  *  Otherwise build http://host:port. */
+function getAgentBaseUrl(node) {
+  if (node.host.startsWith("http://") || node.host.startsWith("https://")) {
+    return node.host.replace(/\/+$/, "");
+  }
+  return `http://${node.host}:${node.port}`;
+}
+
 /** Sync cookie dir from main server to VPS agent before dispatch.
  *  Returns true if sync succeeded or was unnecessary. */
 async function syncCookiesToVps(vpsNode, cookieDir) {
