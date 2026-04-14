@@ -174,29 +174,66 @@ def _import_exported_cookies(browser, cookie_dir):
 def _clear_encrypted_cookies(cookie_dir):
     """Remove Chromium's encrypted cookie files before launch.
 
-    Always clear SQLite cookies when exported_cookies.json exists.
-    setup_account.py uses Google Chrome (channel='chrome') to create cookies,
-    but the agent worker uses Playwright's bundled Chromium. The SQLite cookie
-    store from Chrome is incompatible with Chromium and can cause race
-    conditions where Chromium's async SQLite load overwrites the cookies
-    injected via browser.add_cookies(). Rely solely on JSON import.
+    Only needed for CROSS-PLATFORM scenarios (cookies created on Windows,
+    used on Linux). When both are the same OS with --password-store=basic,
+    the SQLite cookies are directly compatible and should NOT be cleared.
+    browser.add_cookies() alone is NOT sufficient for Google auth — the
+    persistent context's SQLite cookies are the primary auth mechanism.
     """
     json_path = os.path.join(cookie_dir, "exported_cookies.json")
     if not os.path.isfile(json_path):
         return  # no JSON = local cookies, don't touch
 
-    log("  Clearing SQLite cookies (worker uses Chromium, not Chrome that created them)")
+    # Check platform marker — only clear if cookies were created on a different OS
+    import platform as _platform
+    current_os = _platform.system()  # 'Linux', 'Windows', 'Darwin'
+    platform_file = os.path.join(cookie_dir, "cookie_platform.txt")
+    if os.path.isfile(platform_file):
+        try:
+            with open(platform_file, "r") as f:
+                source_os = f.read().strip()
+            if source_os == current_os:
+                log(f"  Cookies from same OS ({source_os}), keeping SQLite cookies")
+                return  # Same OS → SQLite cookies are compatible
+        except Exception:
+            pass  # Can't read marker → assume cross-platform, clear
+
+    log(f"  Cross-platform cookies detected, clearing encrypted SQLite cookies")
     targets = [
         os.path.join(cookie_dir, "Default", "Cookies"),
         os.path.join(cookie_dir, "Default", "Cookies-journal"),
+        os.path.join(cookie_dir, "Default", "Network", "Cookies"),
+        os.path.join(cookie_dir, "Default", "Network", "Cookies-journal"),
     ]
     for f in targets:
         try:
             if os.path.isfile(f):
                 os.remove(f)
-                log(f"  Cleared cookie file: {os.path.basename(f)}")
+                log(f"  Cleared encrypted cookie file: {os.path.basename(f)}")
         except Exception:
             pass
+
+
+def _normalize_cookie_path(cookie_dir):
+    """Ensure SQLite cookies are at Default/Network/Cookies (Chromium's expected path).
+
+    Older Chrome versions store cookies at Default/Cookies, but Playwright's
+    bundled Chromium (and newer Chrome) expects Default/Network/Cookies.
+    If the old path exists but the new one doesn't, copy the files over.
+    """
+    old_cookies = os.path.join(cookie_dir, "Default", "Cookies")
+    new_dir = os.path.join(cookie_dir, "Default", "Network")
+    new_cookies = os.path.join(new_dir, "Cookies")
+
+    if os.path.isfile(old_cookies) and not os.path.isfile(new_cookies):
+        os.makedirs(new_dir, exist_ok=True)
+        shutil.copy2(old_cookies, new_cookies)
+        log(f"  Copied cookies: Default/Cookies → Default/Network/Cookies")
+        old_journal = old_cookies + "-journal"
+        new_journal = new_cookies + "-journal"
+        if os.path.isfile(old_journal) and not os.path.isfile(new_journal):
+            shutil.copy2(old_journal, new_journal)
+            log(f"  Copied journal: Default/Cookies-journal → Default/Network/Cookies-journal")
 
 
 def main():
@@ -231,6 +268,7 @@ def main():
     with sync_playwright() as p:
         _cleanup_chrome_lock(COOKIE_DIR)
         _clear_encrypted_cookies(COOKIE_DIR)
+        _normalize_cookie_path(COOKIE_DIR)
         _extra_args = []
         _headless = False
         if HEADLESS:
@@ -443,6 +481,7 @@ def _launch_browser(p):
     """Launch persistent Chromium browser and return (browser, page)."""
     _cleanup_chrome_lock(COOKIE_DIR)
     _clear_encrypted_cookies(COOKIE_DIR)
+    _normalize_cookie_path(COOKIE_DIR)
     _extra_args = []
     _headless = False
     if HEADLESS:
