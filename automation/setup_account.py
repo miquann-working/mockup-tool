@@ -101,7 +101,8 @@ def setup_account(email):
                 """Check all pages in context for gemini.google.com/app"""
                 for pg in browser.pages:
                     try:
-                        u = pg.url
+                        # Use JS location.href — page.url can be stale with SPA routing
+                        u = pg.evaluate("window.location.href")
                         if ("gemini.google.com/app" in u or "gemini.google.com/gem" in u) \
                                 and "accounts.google.com" not in u and "signin" not in u:
                             return True, u
@@ -109,7 +110,7 @@ def setup_account(email):
                         pass
                 return False, None
 
-            print(f"[setup] Polling for login (page.url={page.url}, pages={len(browser.pages)})...", flush=True)
+            print(f"[setup] Polling for login (pages={len(browser.pages)})...", flush=True)
             while time.time() - start < max_wait:
                 found, found_url = _check_logged_in()
                 if found:
@@ -119,7 +120,7 @@ def setup_account(email):
                     break
                 elapsed = int(time.time() - start)
                 if elapsed % 10 == 0 and elapsed > 0:
-                    urls = [pg.url for pg in browser.pages]
+                    urls = [pg.evaluate("window.location.href") for pg in browser.pages]
                     print(f"[setup] Still polling ({elapsed}s)... urls={urls}", flush=True)
                 time.sleep(1)
 
