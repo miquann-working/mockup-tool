@@ -17,8 +17,11 @@ VNC_PORT=5900
 NOVNC_PORT=6080
 DISPLAY_NUM=:99
 
-# Ensure cookie dir exists — start fresh to avoid corrupted profile
-if [ -d "$COOKIE_DIR/Default" ]; then
+# Ensure cookie dir exists
+mkdir -p "$COOKIE_DIR"
+
+# Only reset profile if --reset flag is passed
+if [ "${2:-}" = "--reset" ] && [ -d "$COOKIE_DIR/Default" ]; then
     echo "Resetting browser profile (keeping exported_cookies.json)..."
     # Backup exported cookies if exists
     if [ -f "$COOKIE_DIR/exported_cookies.json" ]; then
@@ -37,8 +40,6 @@ if [ -d "$COOKIE_DIR/Default" ]; then
     if [ -f /tmp/cookie_platform_backup.txt ]; then
         mv /tmp/cookie_platform_backup.txt "$COOKIE_DIR/cookie_platform.txt"
     fi
-else
-    mkdir -p "$COOKIE_DIR"
 fi
 
 # Kill any existing x11vnc / novnc / chromium
@@ -111,6 +112,7 @@ $PW_CHROMIUM \
     --no-default-browser-check \
     --disable-translate \
     --disable-sync \
+    --user-agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36" \
     "https://accounts.google.com/signin/v2/identifier?flowName=GlifWebSignIn&flowEntry=ServiceLogin&continue=https://gemini.google.com/app" \
     &
 

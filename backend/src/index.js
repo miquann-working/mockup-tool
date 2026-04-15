@@ -2,6 +2,7 @@ require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const path = require("path");
+const rateLimit = require("express-rate-limit");
 const swaggerJsdoc = require("swagger-jsdoc");
 const swaggerUi = require("swagger-ui-express");
 const db = require("./db");
@@ -40,7 +41,12 @@ const swaggerSpec = swaggerJsdoc({
   apis: [path.join(__dirname, "./routes/*.js")],
 });
 
-app.use(cors({ origin: true, credentials: true }));
+app.use(cors({
+  origin: process.env.ALLOWED_ORIGINS
+    ? process.env.ALLOWED_ORIGINS.split(",").map(s => s.trim())
+    : ["http://localhost:3000"],
+  credentials: true,
+}));
 app.use(express.json({ limit: "50mb" }));
 
 // Swagger UI
@@ -50,15 +56,32 @@ app.use("/api-docs", swaggerUi.serve, swaggerUi.setup(swaggerSpec));
 app.use("/uploads", express.static(path.join(__dirname, "../../uploads")));
 app.use("/outputs", express.static(path.join(__dirname, "../../outputs")));
 
+// Rate limiters
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 phút
+  max: 20, // 20 lần login / 15 phút / IP
+  message: { error: "Quá nhiều lần đăng nhập, vui lòng thử lại sau 15 phút" },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+const apiLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 phút
+  max: 200, // 200 request / phút / IP
+  message: { error: "Quá nhiều request, vui lòng thử lại sau" },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
 // Routes
-app.use("/api/auth", authRoutes);
-app.use("/api/users", userRoutes);
-app.use("/api/prompts", promptRoutes);
-app.use("/api/prompt-groups", promptGroupRoutes);
-app.use("/api/accounts", accountRoutes);
-app.use("/api/jobs", jobRoutes);
-app.use("/api/settings", settingRoutes);
-app.use("/api/vps", vpsRoutes);
+app.use("/api/auth", loginLimiter, authRoutes);
+app.use("/api/users", apiLimiter, userRoutes);
+app.use("/api/prompts", apiLimiter, promptRoutes);
+app.use("/api/prompt-groups", apiLimiter, promptGroupRoutes);
+app.use("/api/accounts", apiLimiter, accountRoutes);
+app.use("/api/jobs", apiLimiter, jobRoutes);
+app.use("/api/settings", apiLimiter, settingRoutes);
+app.use("/api/vps", vpsRoutes); // VPS callbacks need no rate limit
 
 // Health check
 app.get("/api/health", (_req, res) => res.json({ ok: true }));

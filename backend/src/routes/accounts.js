@@ -9,8 +9,9 @@ const { authMiddleware, adminOnly } = require("../middleware/auth");
 
 const router = Router();
 
+const SAFE_EMAIL_RE = /^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$/;
+
 const PYTHON = process.env.PYTHON_BIN || "python";
-const CHECK_SCRIPT = path.resolve(__dirname, "../../../automation/check_session.py");
 const SETUP_SCRIPT = path.resolve(__dirname, "../../../automation/setup_account.py");
 const COOKIES_DIR = path.resolve(__dirname, "../../../cookies");
 
@@ -40,7 +41,12 @@ const uploadZip = multer({
  *         description: Mảng tài khoản Gemini
  */
 router.get("/", authMiddleware, adminOnly, (req, res) => {
-  const accounts = db.prepare("SELECT * FROM gemini_accounts ORDER BY id").all();
+  const accounts = db.prepare(`
+    SELECT ga.*, vn.name AS vps_name
+    FROM gemini_accounts ga
+    LEFT JOIN vps_nodes vn ON ga.vps_id = vn.id
+    ORDER BY ga.id
+  `).all();
   res.json(accounts);
 });
 
@@ -142,48 +148,58 @@ router.post("/:id/reset", authMiddleware, adminOnly, (req, res) => {
  * /api/accounts/{id}/health:
  *   post:
  *     tags: [Gemini Accounts]
- *     summary: Kiểm tra session Gemini còn hoạt động không
+ *     summary: Kiểm tra session Gemini qua VPS agent
  *     security:
  *       - bearerAuth: []
  */
-router.post("/:id/health", authMiddleware, adminOnly, (req, res) => {
+router.post("/:id/health", authMiddleware, adminOnly, async (req, res) => {
   const accountId = Number(req.params.id);
-  const account = db.prepare("SELECT * FROM gemini_accounts WHERE id = ?").get(accountId);
+  const account = db.prepare(`
+    SELECT ga.*, vn.host, vn.port, vn.secret_key, vn.name AS vps_name
+    FROM gemini_accounts ga
+    LEFT JOIN vps_nodes vn ON ga.vps_id = vn.id
+    WHERE ga.id = ?
+  `).get(accountId);
   if (!account) return res.status(404).json({ error: "Account not found" });
 
-  const child = spawn(PYTHON, [CHECK_SCRIPT], {
-    env: { ...process.env, COOKIE_DIR: account.cookie_dir },
-    cwd: path.resolve(__dirname, "../../../"),
-    timeout: 60_000,
-  });
+  if (!account.vps_id || !account.host) {
+    return res.json({ status: "error", message: "Account chưa gán VPS" });
+  }
 
-  let stdout = "";
-  let stderr = "";
-  child.stdout.on("data", (d) => (stdout += d));
-  child.stderr.on("data", (d) => (stderr += d));
-  child.on("close", (code) => {
-    const result = stdout.trim();
-    if (code === 0 && result === "ok") {
-      res.json({ status: "ok", message: "Session hoạt động bình thường" });
-    } else {
-      // Auto-disable if expired
-      if (result === "session_expired") {
-        db.prepare("UPDATE gemini_accounts SET status = 'disabled' WHERE id = ?").run(accountId);
-      }
-      res.json({
-        status: "error",
-        message:
-          result === "session_expired"
-            ? "Session hết hạn — cần đăng nhập lại"
-            : result === "cookie_dir_missing"
-            ? "Thư mục cookie không tồn tại"
-            : `Lỗi kiểm tra: ${result || stderr.trim()}`,
-      });
+  try {
+    const baseUrl = account.host.startsWith("http")
+      ? account.host.replace(/\/+$/, "")
+      : `http://${account.host}:${account.port}`;
+
+    const resp = await fetch(`${baseUrl}/agent/account/health`, {
+      method: "POST",
+      headers: { "X-Api-Key": account.secret_key, "Content-Type": "application/json" },
+      body: JSON.stringify({ email: account.email }),
+      signal: AbortSignal.timeout(20_000),
+    });
+
+    if (!resp.ok) {
+      return res.json({ status: "error", message: `VPS agent error: HTTP ${resp.status}` });
     }
-  });
-  child.on("error", (err) => {
-    res.status(500).json({ status: "error", message: `Không thể chạy script: ${err.message}` });
-  });
+
+    const data = await resp.json();
+
+    // Auto-update DB status based on VPS result
+    if (data.status === "session_expired" || data.status === "no_cookies") {
+      db.prepare("UPDATE gemini_accounts SET status = 'disabled' WHERE id = ?").run(accountId);
+    } else if (data.ok && account.status === "disabled") {
+      db.prepare("UPDATE gemini_accounts SET status = 'free' WHERE id = ?").run(accountId);
+    }
+
+    res.json({
+      status: data.ok ? "ok" : "error",
+      message: data.message,
+      auth_cookies: data.auth_cookies,
+      vps: account.vps_name,
+    });
+  } catch (err) {
+    res.json({ status: "error", message: `Không thể kết nối VPS ${account.vps_name}: ${err.message}` });
+  }
 });
 
 /**
@@ -191,37 +207,52 @@ router.post("/:id/health", authMiddleware, adminOnly, (req, res) => {
  * /api/accounts/health-all:
  *   post:
  *     tags: [Gemini Accounts]
- *     summary: Kiểm tra tất cả sessions
+ *     summary: Kiểm tra tất cả sessions qua VPS agents
  *     security:
  *       - bearerAuth: []
  */
 router.post("/health-all", authMiddleware, adminOnly, async (req, res) => {
-  const accounts = db.prepare("SELECT * FROM gemini_accounts ORDER BY id").all();
+  const accounts = db.prepare(`
+    SELECT ga.*, vn.host, vn.port, vn.secret_key, vn.name AS vps_name
+    FROM gemini_accounts ga
+    LEFT JOIN vps_nodes vn ON ga.vps_id = vn.id
+    ORDER BY ga.id
+  `).all();
 
-  const promises = accounts.map((account) => new Promise((resolve) => {
-    const child = spawn(PYTHON, [CHECK_SCRIPT], {
-      env: { ...process.env, COOKIE_DIR: account.cookie_dir },
-      cwd: path.resolve(__dirname, "../../../"),
-      timeout: 60_000,
-    });
+  const promises = accounts.map(async (account) => {
+    if (!account.vps_id || !account.host) {
+      return { id: account.id, email: account.email, status: "error", message: "Chưa gán VPS" };
+    }
 
-    let stdout = "";
-    child.stdout.on("data", (d) => (stdout += d));
-    child.on("close", (code) => {
-      const r = stdout.trim();
-      if (code === 0 && r === "ok") {
-        resolve({ id: account.id, email: account.email, status: "ok" });
-      } else {
-        if (r === "session_expired") {
-          db.prepare("UPDATE gemini_accounts SET status = 'disabled' WHERE id = ?").run(account.id);
-        }
-        resolve({ id: account.id, email: account.email, status: "error", message: r });
+    try {
+      const baseUrl = account.host.startsWith("http")
+        ? account.host.replace(/\/+$/, "")
+        : `http://${account.host}:${account.port}`;
+
+      const resp = await fetch(`${baseUrl}/agent/account/health`, {
+        method: "POST",
+        headers: { "X-Api-Key": account.secret_key, "Content-Type": "application/json" },
+        body: JSON.stringify({ email: account.email }),
+        signal: AbortSignal.timeout(20_000),
+      });
+
+      if (!resp.ok) {
+        return { id: account.id, email: account.email, status: "error", message: `HTTP ${resp.status}` };
       }
-    });
-    child.on("error", (err) => {
-      resolve({ id: account.id, email: account.email, status: "error", message: err.message });
-    });
-  }));
+
+      const data = await resp.json();
+
+      if (data.status === "session_expired" || data.status === "no_cookies") {
+        db.prepare("UPDATE gemini_accounts SET status = 'disabled' WHERE id = ?").run(account.id);
+      } else if (data.ok && account.status === "disabled") {
+        db.prepare("UPDATE gemini_accounts SET status = 'free' WHERE id = ?").run(account.id);
+      }
+
+      return { id: account.id, email: account.email, status: data.ok ? "ok" : "error", message: data.message };
+    } catch (err) {
+      return { id: account.id, email: account.email, status: "error", message: `VPS ${account.vps_name}: ${err.message}` };
+    }
+  });
 
   const results = await Promise.all(promises);
   res.json(results);
@@ -252,6 +283,9 @@ router.post("/upload", authMiddleware, adminOnly, uploadZip.single("cookies"), (
   const { email } = req.body;
   if (!email || !req.file) {
     return res.status(400).json({ error: "Email và file zip cookie là bắt buộc" });
+  }
+  if (!SAFE_EMAIL_RE.test(email)) {
+    return res.status(400).json({ error: "Email không hợp lệ" });
   }
 
   const cookieDir = path.join(COOKIES_DIR, email);

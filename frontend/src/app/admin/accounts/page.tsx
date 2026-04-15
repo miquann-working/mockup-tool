@@ -7,10 +7,12 @@ interface GeminiAccount {
   id: number;
   email: string;
   cookie_dir: string;
-  status: "free" | "busy" | "cooldown" | "disabled";
+  status: "free" | "busy" | "cooldown" | "disabled" | "active";
   last_used_at: string | null;
   created_at: string;
   rate_limited_until: string | null;
+  vps_id: number | null;
+  vps_name: string | null;
 }
 
 function formatTime(dt: string | null | undefined) {
@@ -21,11 +23,14 @@ function formatTime(dt: string | null | undefined) {
 
 const statusConfig: Record<string, { label: string; color: string; bg: string; icon: string }> = {
   free: { label: "Sẵn sàng", color: "text-green-700", bg: "bg-green-100", icon: "✓" },
+  active: { label: "Sẵn sàng", color: "text-green-700", bg: "bg-green-100", icon: "✓" },
   busy: { label: "Đang dùng", color: "text-blue-700", bg: "bg-blue-100", icon: "⟳" },
   cooldown: { label: "Cooldown", color: "text-amber-700", bg: "bg-amber-100", icon: "⏳" },
-  disabled: { label: "Tắt", color: "text-slate-600", bg: "bg-slate-100", icon: "✗" },
+  disabled: { label: "Hết session", color: "text-red-700", bg: "bg-red-100", icon: "✗" },
   rate_limited: { label: "Hết lượt tạo ảnh", color: "text-red-700", bg: "bg-red-100", icon: "⛔" },
 };
+
+type StatusFilter = "all" | "free" | "busy" | "cooldown" | "disabled" | "rate_limited";
 
 function isRateLimited(a: GeminiAccount): boolean {
   if (!a.rate_limited_until) return false;
@@ -46,7 +51,13 @@ function getRateLimitRemaining(a: GeminiAccount): string {
   return `còn ${mins}p`;
 }
 
-type ModalMode = null | "add" | "edit" | "login";
+function getEffectiveStatus(a: GeminiAccount): string {
+  if (isRateLimited(a)) return "rate_limited";
+  if (a.status === "active") return "free";
+  return a.status;
+}
+
+type ModalMode = null | "edit" | "login";
 
 export default function AdminAccountsPage() {
   const [accounts, setAccounts] = useState<GeminiAccount[]>([]);
@@ -59,9 +70,13 @@ export default function AdminAccountsPage() {
   const [saving, setSaving] = useState(false);
   const [checking, setChecking] = useState<number | "all" | null>(null);
   const [healthResults, setHealthResults] = useState<Record<number, { status: string; message?: string }>>({});
-  const [cookieFile, setCookieFile] = useState<File | null>(null);
-  const [uploading, setUploading] = useState(false);
-  const [loginStatus, setLoginStatus] = useState<"idle" | "opening" | "waiting" | "success" | "error">("idle");
+  const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
+
+  // Login states
+  const [loginStatus, setLoginStatus] = useState<"idle" | "opening" | "active" | "stopping" | "success" | "error">("idle");
+  const [loginVncUrl, setLoginVncUrl] = useState("");
+  const [loginMessage, setLoginMessage] = useState("");
+  const [loginAuthCookies, setLoginAuthCookies] = useState(0);
 
   const fetchAccounts = useCallback(() => {
     api.get("/accounts").then((r) => setAccounts(r.data)).finally(() => setLoading(false));
@@ -69,21 +84,13 @@ export default function AdminAccountsPage() {
 
   useEffect(() => { fetchAccounts(); }, [fetchAccounts]);
 
-  // Poll for account changes when login browser is open
+  // Auto-refresh accounts every 30s to pick up status changes (e.g. session expired)
   useEffect(() => {
-    if (loginStatus !== "waiting") return;
     const interval = setInterval(() => {
-      api.get("/accounts").then((r) => {
-        const updated = r.data as GeminiAccount[];
-        setAccounts(updated);
-        const found = updated.find((a: GeminiAccount) => a.email === email);
-        if (found && found.status === "free") {
-          setLoginStatus("success");
-        }
-      });
-    }, 3000);
+      api.get("/accounts").then((r) => setAccounts(r.data)).catch(() => {});
+    }, 30_000);
     return () => clearInterval(interval);
-  }, [loginStatus, email]);
+  }, []);
 
   const closeModal = () => {
     setModalMode(null);
@@ -91,18 +98,10 @@ export default function AdminAccountsPage() {
     setEmail("");
     setCookieDir("");
     setStatus("free");
-    setCookieFile(null);
     setLoginStatus("idle");
-  };
-
-  const openAdd = () => {
-    closeModal();
-    setModalMode("add");
-  };
-
-  const openLogin = () => {
-    closeModal();
-    setModalMode("login");
+    setLoginVncUrl("");
+    setLoginMessage("");
+    setLoginAuthCookies(0);
   };
 
   const openEdit = (a: GeminiAccount) => {
@@ -120,8 +119,6 @@ export default function AdminAccountsPage() {
     try {
       if (editing) {
         await api.put(`/accounts/${editing.id}`, { email, cookie_dir: cookieDir, status });
-      } else {
-        await api.post("/accounts", { email, cookie_dir: cookieDir });
       }
       closeModal();
       fetchAccounts();
@@ -175,71 +172,76 @@ export default function AdminAccountsPage() {
     }
   };
 
-  const handleEmailChange = (val: string) => {
-    setEmail(val);
-    if (!editing) {
-      setCookieDir(val ? `cookies/${val}` : "");
-    }
+  // ── Login handlers (via VPS) ──
+  const handleRelogin = (account: GeminiAccount) => {
+    closeModal();
+    setEditing(account);
+    setEmail(account.email);
+    setModalMode("login");
   };
 
-    const handleUploadCookie = async () => {
-    if (!email.trim() || !cookieFile) return;
-    setUploading(true);
-    try {
-      const fd = new FormData();
-      fd.append("email", email.trim());
-      fd.append("cookies", cookieFile);
-      const token = localStorage.getItem("token");
-      const backendUrl = window.location.protocol + "//" + window.location.hostname + ":4000";
-      const resp = await fetch(backendUrl + "/api/accounts/upload", {
-        method: "POST",
-        headers: { Authorization: "Bearer " + (token || "") },
-        body: fd,
-      });
-      if (!resp.ok) {
-        const data = await resp.json().catch(() => ({}));
-        throw new Error(data.error || "Upload thất bại");
-      }
-      closeModal();
-      fetchAccounts();
-    } catch (err: unknown) {
-      const e = err as Error;
-      alert(e.message || "Upload thất bại");
-    } finally {
-      setUploading(false);
-    }
-  };
-
-  const handleSetupLogin = async () => {
-    if (!email.trim()) return;
+  const handleLoginStart = async (reset = false) => {
+    if (!editing?.vps_id || !email.trim()) return;
     setLoginStatus("opening");
+    setLoginMessage("");
     try {
-      await api.post("/accounts/setup-login", { email: email.trim() });
-      setLoginStatus("waiting");
+      const r = await api.post(`/vps/${editing.vps_id}/login/start`, {
+        email: email.trim(),
+        reset,
+      });
+      setLoginVncUrl(r.data.vnc_url);
+      setLoginStatus("active");
+      setLoginMessage("Trình duyệt đã mở trên VPS. Hãy đăng nhập Google trong cửa sổ noVNC.");
     } catch (err: unknown) {
       const axiosErr = err as { response?: { data?: { error?: string } } };
-      alert(axiosErr.response?.data?.error || "Không thể mở browser");
+      setLoginMessage(axiosErr.response?.data?.error || "Không thể mở browser trên VPS");
       setLoginStatus("error");
     }
   };
 
-  const handleRelogin = async (account: GeminiAccount) => {
-    closeModal();
-    setEmail(account.email);
-    setModalMode("login");
-    // small delay to let state update, then trigger login
-    setTimeout(async () => {
-      setLoginStatus("opening");
-      try {
-        await api.post("/accounts/setup-login", { email: account.email });
-        setLoginStatus("waiting");
-      } catch {
+  const handleLoginFinish = async () => {
+    if (!editing?.vps_id || !email.trim()) return;
+    setLoginStatus("stopping");
+    setLoginMessage("Đang dừng trình duyệt và kiểm tra cookies...");
+    try {
+      const r = await api.post(`/vps/${editing.vps_id}/login/stop`, {
+        email: email.trim(),
+      });
+      if (r.data.ok) {
+        setLoginAuthCookies(r.data.auth_cookies || 0);
+        setLoginMessage(r.data.message || "Đăng nhập thành công!");
+        setLoginStatus("success");
+        fetchAccounts();
+      } else {
+        setLoginMessage(r.data.message || "Đăng nhập thất bại");
         setLoginStatus("error");
       }
-    }, 100);
+    } catch (err: unknown) {
+      const axiosErr = err as { response?: { data?: { error?: string } } };
+      setLoginMessage(axiosErr.response?.data?.error || "Lỗi khi hoàn tất đăng nhập");
+      setLoginStatus("error");
+    }
   };
 
-  const freeCount = accounts.filter((a) => a.status === "free" && !isRateLimited(a)).length;
+  // ── Filter logic ──
+  const filteredAccounts = accounts.filter((a) => {
+    if (statusFilter === "all") return true;
+    const eff = getEffectiveStatus(a);
+    return eff === statusFilter;
+  });
+
+  const freeCount = accounts.filter((a) => (a.status === "free" || a.status === "active") && !isRateLimited(a)).length;
+  const disabledCount = accounts.filter((a) => a.status === "disabled").length;
+  const rateLimitedCount = accounts.filter((a) => isRateLimited(a)).length;
+  const busyCount = accounts.filter((a) => a.status === "busy").length;
+
+  const filterButtons: { key: StatusFilter; label: string; count: number }[] = [
+    { key: "all", label: "Tất cả", count: accounts.length },
+    { key: "free", label: "Sẵn sàng", count: freeCount },
+    { key: "busy", label: "Đang dùng", count: busyCount },
+    { key: "disabled", label: "Hết session", count: disabledCount },
+    { key: "rate_limited", label: "Hết lượt", count: rateLimitedCount },
+  ];
 
   return (
     <div>
@@ -251,253 +253,209 @@ export default function AdminAccountsPage() {
             <span className="font-medium text-green-600">{freeCount}</span> / {accounts.length} sẵn sàng
           </p>
         </div>
-        <div className="flex gap-2">
-          <button
-            onClick={handleHealthCheckAll}
-            disabled={checking !== null}
-            className="flex items-center gap-1.5 rounded-lg border border-slate-300 px-4 py-2 text-sm font-medium text-slate-700 transition hover:bg-slate-50 disabled:opacity-50"
-          >
-            {checking === "all" ? (
-              <div className="h-4 w-4 animate-spin rounded-full border-2 border-slate-400 border-t-transparent" />
-            ) : (
-              <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor">
-                <path strokeLinecap="round" strokeLinejoin="round" d="M9 12.75L11.25 15 15 9.75M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-              </svg>
-            )}
-            Check All
-          </button>
-          <button
-            onClick={openAdd}
-            className="flex items-center gap-1.5 rounded-lg border border-slate-300 px-4 py-2 text-sm font-medium text-slate-700 transition hover:bg-slate-50"
-          >
+        <button
+          onClick={handleHealthCheckAll}
+          disabled={checking !== null}
+          className="flex items-center gap-1.5 rounded-lg border border-slate-300 px-4 py-2 text-sm font-medium text-slate-700 transition hover:bg-slate-50 disabled:opacity-50"
+        >
+          {checking === "all" ? (
+            <div className="h-4 w-4 animate-spin rounded-full border-2 border-slate-400 border-t-transparent" />
+          ) : (
             <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" d="M19.5 14.25v-2.625a3.375 3.375 0 00-3.375-3.375h-1.5A1.125 1.125 0 0113.5 7.125v-1.5a3.375 3.375 0 00-3.375-3.375H8.25m3.75 9v6m3-3H9m1.5-12H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 00-9-9z" />
+              <path strokeLinecap="round" strokeLinejoin="round" d="M9 12.75L11.25 15 15 9.75M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
             </svg>
-            Upload Cookie
-          </button>
+          )}
+          Check All Sessions
+        </button>
+      </div>
+
+      {/* ── Status filter ── */}
+      <div className="mb-4 flex flex-wrap gap-2">
+        {filterButtons.map((f) => (
           <button
-            onClick={openLogin}
-            className="flex items-center gap-1.5 rounded-lg bg-blue-600 px-4 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-blue-700"
+            key={f.key}
+            onClick={() => setStatusFilter(f.key)}
+            className={`rounded-lg px-3 py-1.5 text-xs font-medium transition ${
+              statusFilter === f.key
+                ? "bg-blue-600 text-white"
+                : "bg-slate-100 text-slate-600 hover:bg-slate-200"
+            }`}
           >
-            <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" d="M12 4.5v15m7.5-7.5h-15" />
-            </svg>
-            Đăng nhập Gemini
+            {f.label} ({f.count})
           </button>
-        </div>
+        ))}
       </div>
 
       {/* ── LOGIN MODAL ── */}
-      {modalMode === "login" && (
+      {modalMode === "login" && editing && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
-          <div className="w-full max-w-lg rounded-xl bg-white p-6 shadow-xl">
-            <div className="mb-5 flex items-center gap-3">
-              <div className="flex h-12 w-12 items-center justify-center rounded-full bg-blue-100">
-                <svg className="h-6 w-6 text-blue-600" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor">
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M15.75 6a3.75 3.75 0 11-7.5 0 3.75 3.75 0 017.5 0zM4.501 20.118a7.5 7.5 0 0114.998 0A17.933 17.933 0 0112 21.75c-2.676 0-5.216-.584-7.499-1.632z" />
-                </svg>
-              </div>
-              <div>
-                <h3 className="text-lg font-semibold text-slate-800">Đăng nhập tài khoản Gemini</h3>
-                <p className="text-sm text-slate-500">Browser sẽ mở để bạn đăng nhập Google</p>
-              </div>
-            </div>
+          <div className="w-full max-w-md rounded-xl bg-white p-6 shadow-xl">
+            <h3 className="mb-1 text-lg font-semibold text-slate-800">
+              Đăng nhập lại trên {editing.vps_name || `VPS #${editing.vps_id}`}
+            </h3>
+            <p className="mb-4 text-sm text-slate-500">
+              Account: <strong>{email}</strong>
+            </p>
 
-            {loginStatus === "idle" && (
-              <>
-                <div className="mb-4">
-                  <label className="mb-1.5 block text-sm font-medium text-slate-700">Email Google</label>
-                  <input
-                    value={email}
-                    onChange={(e) => setEmail(e.target.value)}
-                    className="w-full rounded-lg border border-slate-300 px-4 py-2.5 text-sm focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500/20"
-                    placeholder="yourname@gmail.com"
-                    autoFocus
-                  />
+            {!editing.vps_id && (
+              <div className="space-y-3">
+                <div className="rounded-lg border border-red-200 bg-red-50 p-4">
+                  <p className="text-sm font-semibold text-red-800">Account chưa gán VPS</p>
+                  <p className="mt-1 text-xs text-red-600">Hãy gán account vào VPS trước khi đăng nhập.</p>
                 </div>
-                <div className="rounded-lg bg-slate-50 p-4">
-                  <h4 className="mb-2 text-sm font-medium text-slate-700">Hướng dẫn:</h4>
-                  <ol className="space-y-1.5 text-sm text-slate-600">
-                    <li className="flex gap-2"><span className="font-semibold text-blue-600">1.</span> Nhập email rồi bấm &quot;Mở Browser&quot;</li>
-                    <li className="flex gap-2"><span className="font-semibold text-blue-600">2.</span> Browser Chromium sẽ mở ra trang đăng nhập Google</li>
-                    <li className="flex gap-2"><span className="font-semibold text-blue-600">3.</span> Đăng nhập bình thường (nhập mật khẩu, xác thực 2 bước...)</li>
-                    <li className="flex gap-2"><span className="font-semibold text-blue-600">4.</span> Khi Gemini load xong → cookie tự động lưu, browser tự đóng</li>
-                  </ol>
-                </div>
-                <div className="mt-5 flex justify-end gap-2">
+                <button onClick={closeModal} className="w-full rounded-lg bg-slate-100 px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-200">Đóng</button>
+              </div>
+            )}
+
+            {editing.vps_id && loginStatus === "idle" && (
+              <div className="space-y-3">
+                <p className="text-sm text-slate-600">
+                  Nhấn &quot;Bắt đầu&quot; để mở trình duyệt trên VPS. Sau đó đăng nhập Google qua noVNC.
+                </p>
+                <div className="flex gap-2">
                   <button
-                    onClick={closeModal}
-                    className="rounded-lg px-4 py-2 text-sm font-medium text-slate-600 transition hover:bg-slate-100"
+                    onClick={() => handleLoginStart(false)}
+                    className="flex-1 rounded-lg bg-blue-600 px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-blue-700"
                   >
-                    Hủy
+                    ▶ Bắt đầu đăng nhập
                   </button>
                   <button
-                    onClick={handleSetupLogin}
-                    disabled={!email.trim()}
-                    className="rounded-lg bg-blue-600 px-6 py-2 text-sm font-semibold text-white transition hover:bg-blue-700 disabled:opacity-50"
+                    onClick={() => handleLoginStart(true)}
+                    className="rounded-lg border border-amber-300 bg-amber-50 px-3 py-2.5 text-sm font-medium text-amber-700 transition hover:bg-amber-100"
+                    title="Xóa cookies cũ và đăng nhập lại từ đầu"
                   >
-                    Mở Browser
+                    🔄 Reset
                   </button>
                 </div>
-              </>
+                <div className="flex justify-end">
+                  <button onClick={closeModal} className="rounded-lg px-4 py-2 text-sm font-medium text-slate-600 transition hover:bg-slate-100">Hủy</button>
+                </div>
+              </div>
             )}
 
             {loginStatus === "opening" && (
-              <div className="flex flex-col items-center py-8">
-                <div className="h-10 w-10 animate-spin rounded-full border-3 border-blue-600 border-t-transparent" />
-                <p className="mt-4 text-sm font-medium text-slate-600">Đang mở browser...</p>
+              <div className="flex items-center gap-3 py-4">
+                <div className="h-5 w-5 animate-spin rounded-full border-2 border-blue-600 border-t-transparent" />
+                <span className="text-sm text-slate-600">Đang khởi động trình duyệt trên VPS...</span>
               </div>
             )}
 
-            {loginStatus === "waiting" && (
-              <div className="flex flex-col items-center py-6">
-                <div className="mb-4 flex h-16 w-16 items-center justify-center rounded-full bg-amber-100">
-                  <svg className="h-8 w-8 text-amber-600" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor">
-                    <path strokeLinecap="round" strokeLinejoin="round" d="M12 6v6h4.5m4.5 0a9 9 0 11-18 0 9 9 0 0118 0z" />
-                  </svg>
+            {loginStatus === "active" && (
+              <div className="space-y-4">
+                <div className="rounded-lg border border-green-200 bg-green-50 p-3">
+                  <p className="mb-1 text-sm font-medium text-green-800">✅ Trình duyệt đã sẵn sàng</p>
+                  <p className="text-xs text-green-700">{loginMessage}</p>
                 </div>
-                <h4 className="mb-1 text-base font-semibold text-slate-700">Đang chờ bạn đăng nhập...</h4>
-                <p className="mb-4 text-center text-sm text-slate-500">
-                  Hãy đăng nhập vào Google trên cửa sổ browser vừa mở.<br />
-                  Trang này sẽ tự cập nhật khi hoàn tất.
-                </p>
-                <div className="flex items-center gap-2 rounded-lg bg-blue-50 px-4 py-2">
-                  <div className="h-3 w-3 animate-pulse rounded-full bg-blue-500" />
-                  <span className="text-sm font-medium text-blue-700">Đang theo dõi: {email}</span>
+                <a
+                  href={loginVncUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="flex items-center justify-center gap-2 rounded-lg bg-indigo-600 px-4 py-3 text-sm font-semibold text-white transition hover:bg-indigo-700"
+                >
+                  🖥 Mở noVNC để đăng nhập
+                  <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M13.5 6H5.25A2.25 2.25 0 003 8.25v10.5A2.25 2.25 0 005.25 21h10.5A2.25 2.25 0 0018 18.75V10.5m-10.5 6L21 3m0 0h-5.25M21 3v5.25" />
+                  </svg>
+                </a>
+                <div className="rounded-lg border border-amber-200 bg-amber-50 p-3">
+                  <p className="text-xs text-amber-700 leading-relaxed">
+                    <strong>Lưu ý:</strong> Sau khi đăng nhập xong trên noVNC, quay lại đây nhấn &quot;Hoàn tất&quot;.
+                  </p>
                 </div>
                 <button
-                  onClick={closeModal}
-                  className="mt-6 rounded-lg px-4 py-2 text-sm font-medium text-slate-500 transition hover:bg-slate-100"
+                  onClick={handleLoginFinish}
+                  className="w-full rounded-lg bg-green-600 px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-green-700"
                 >
-                  Đóng (browser vẫn hoạt động)
+                  ✅ Hoàn tất đăng nhập
                 </button>
+                <div className="flex justify-end">
+                  <button onClick={closeModal} className="rounded-lg px-4 py-2 text-sm font-medium text-slate-600 transition hover:bg-slate-100">Hủy</button>
+                </div>
+              </div>
+            )}
+
+            {loginStatus === "stopping" && (
+              <div className="flex items-center gap-3 py-4">
+                <div className="h-5 w-5 animate-spin rounded-full border-2 border-green-600 border-t-transparent" />
+                <span className="text-sm text-slate-600">{loginMessage}</span>
               </div>
             )}
 
             {loginStatus === "success" && (
-              <div className="flex flex-col items-center py-6">
-                <div className="mb-4 flex h-16 w-16 items-center justify-center rounded-full bg-green-100">
-                  <svg className="h-8 w-8 text-green-600" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor">
-                    <path strokeLinecap="round" strokeLinejoin="round" d="M9 12.75L11.25 15 15 9.75M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-                  </svg>
+              <div className="space-y-3">
+                <div className="rounded-lg border border-green-200 bg-green-50 p-4 text-center">
+                  <p className="text-2xl mb-1">🎉</p>
+                  <p className="text-sm font-semibold text-green-800">{loginMessage}</p>
+                  <p className="mt-1 text-xs text-green-600">Auth cookies: {loginAuthCookies}/6</p>
                 </div>
-                <h4 className="mb-1 text-base font-semibold text-green-700">Thêm tài khoản thành công!</h4>
-                <p className="text-sm text-slate-500">{email} đã sẵn sàng sử dụng</p>
-                <button
-                  onClick={() => { closeModal(); fetchAccounts(); }}
-                  className="mt-6 rounded-lg bg-green-600 px-6 py-2 text-sm font-semibold text-white transition hover:bg-green-700"
-                >
-                  Đóng
-                </button>
+                <button onClick={closeModal} className="w-full rounded-lg bg-blue-600 px-4 py-2 text-sm font-semibold text-white transition hover:bg-blue-700">Đóng</button>
               </div>
             )}
 
             {loginStatus === "error" && (
-              <div className="flex flex-col items-center py-6">
-                <div className="mb-4 flex h-16 w-16 items-center justify-center rounded-full bg-red-100">
-                  <svg className="h-8 w-8 text-red-600" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor">
-                    <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z" />
-                  </svg>
+              <div className="space-y-3">
+                <div className="rounded-lg border border-red-200 bg-red-50 p-4">
+                  <p className="text-sm font-semibold text-red-800">❌ Thất bại</p>
+                  <p className="mt-1 text-xs text-red-600">{loginMessage}</p>
                 </div>
-                <h4 className="mb-1 text-base font-semibold text-red-700">Lỗi</h4>
-                <p className="text-sm text-slate-500">Không thể mở browser. Thử lại sau.</p>
-                <button
-                  onClick={() => setLoginStatus("idle")}
-                  className="mt-6 rounded-lg bg-blue-600 px-6 py-2 text-sm font-semibold text-white transition hover:bg-blue-700"
-                >
-                  Thử lại
-                </button>
+                <div className="flex gap-2">
+                  <button onClick={() => setLoginStatus("idle")} className="flex-1 rounded-lg bg-blue-600 px-4 py-2 text-sm font-semibold text-white transition hover:bg-blue-700">Thử lại</button>
+                  <button onClick={closeModal} className="rounded-lg px-4 py-2 text-sm font-medium text-slate-600 transition hover:bg-slate-100">Đóng</button>
+                </div>
               </div>
             )}
           </div>
         </div>
       )}
 
-      {/* ── ADD/EDIT MODAL ── */}
-      {(modalMode === "add" || modalMode === "edit") && (
+      {/* ── EDIT MODAL ── */}
+      {modalMode === "edit" && editing && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
           <div className="w-full max-w-md rounded-xl bg-white p-6 shadow-xl">
-            <h3 className="mb-4 text-lg font-semibold text-slate-800">
-              {editing ? "Sửa Account" : "Thêm Account (Upload Cookie)"}
-            </h3>
+            <h3 className="mb-4 text-lg font-semibold text-slate-800">Sửa Account</h3>
             <div className="space-y-3">
               <div>
                 <label className="mb-1 block text-sm font-medium text-slate-600">Email</label>
                 <input
                   value={email}
-                  onChange={(e) => handleEmailChange(e.target.value)}
+                  onChange={(e) => setEmail(e.target.value)}
                   className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500/20"
                   placeholder="account@gmail.com"
                   autoFocus
                 />
               </div>
-              {!editing && (
-                <div className="rounded-lg border border-dashed border-blue-300 bg-blue-50/50 p-4">
-                  <label className="mb-2 block text-sm font-medium text-blue-700">
-                    Upload file cookie (.zip)
-                  </label>
-                  <input
-                    type="file"
-                    accept=".zip"
-                    onChange={(e) => setCookieFile(e.target.files?.[0] || null)}
-                    className="w-full text-sm text-slate-600 file:mr-2 file:rounded-md file:border-0 file:bg-blue-100 file:px-3 file:py-1.5 file:text-xs file:font-medium file:text-blue-700 hover:file:bg-blue-200"
-                  />
-                  <p className="mt-2 text-xs text-blue-600">
-                    Lấy file .zip từ thư mục <code className="rounded bg-blue-100 px-1 font-mono">cookies/</code> sau khi chạy setup
-                  </p>
-                </div>
-              )}
-              {editing && (
-                <>
-                  <div>
-                    <label className="mb-1 block text-sm font-medium text-slate-600">Cookie Directory</label>
-                    <input
-                      value={cookieDir}
-                      onChange={(e) => setCookieDir(e.target.value)}
-                      className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm font-mono focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500/20"
-                      placeholder="cookies/account@gmail.com"
-                    />
-                  </div>
-                  <div>
-                    <label className="mb-1 block text-sm font-medium text-slate-600">Trạng thái</label>
-                    <select
-                      value={status}
-                      onChange={(e) => setStatus(e.target.value)}
-                      className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500/20"
-                    >
-                      <option value="free">Sẵn sàng</option>
-                      <option value="busy">Đang dùng</option>
-                      <option value="cooldown">Cooldown</option>
-                      <option value="disabled">Tắt</option>
-                    </select>
-                  </div>
-                </>
-              )}
+              <div>
+                <label className="mb-1 block text-sm font-medium text-slate-600">Cookie Directory</label>
+                <input
+                  value={cookieDir}
+                  onChange={(e) => setCookieDir(e.target.value)}
+                  className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm font-mono focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500/20"
+                  placeholder="cookies/account@gmail.com"
+                />
+              </div>
+              <div>
+                <label className="mb-1 block text-sm font-medium text-slate-600">Trạng thái</label>
+                <select
+                  value={status}
+                  onChange={(e) => setStatus(e.target.value)}
+                  className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500/20"
+                >
+                  <option value="free">Sẵn sàng</option>
+                  <option value="busy">Đang dùng</option>
+                  <option value="cooldown">Cooldown</option>
+                  <option value="disabled">Hết session</option>
+                </select>
+              </div>
             </div>
             <div className="mt-5 flex justify-end gap-2">
+              <button onClick={closeModal} className="rounded-lg px-4 py-2 text-sm font-medium text-slate-600 transition hover:bg-slate-100">Hủy</button>
               <button
-                onClick={closeModal}
-                className="rounded-lg px-4 py-2 text-sm font-medium text-slate-600 transition hover:bg-slate-100"
+                onClick={handleSave}
+                disabled={saving || !email.trim() || !cookieDir.trim()}
+                className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-semibold text-white transition hover:bg-blue-700 disabled:opacity-50"
               >
-                Hủy
+                {saving ? "Đang lưu..." : "Lưu"}
               </button>
-              {!editing && cookieFile ? (
-                <button
-                  onClick={handleUploadCookie}
-                  disabled={uploading || !email.trim()}
-                  className="rounded-lg bg-green-600 px-4 py-2 text-sm font-semibold text-white transition hover:bg-green-700 disabled:opacity-50"
-                >
-                  {uploading ? "Đang upload..." : "Upload & Thêm"}
-                </button>
-              ) : editing ? (
-                <button
-                  onClick={handleSave}
-                  disabled={saving || !email.trim() || !cookieDir.trim()}
-                  className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-semibold text-white transition hover:bg-blue-700 disabled:opacity-50"
-                >
-                  {saving ? "Đang lưu..." : "Lưu"}
-                </button>
-              ) : null}
             </div>
           </div>
         </div>
@@ -516,19 +474,18 @@ export default function AdminAccountsPage() {
             </svg>
           </div>
           <p className="text-sm font-medium text-slate-500">Chưa có tài khoản Gemini nào</p>
-          <p className="mt-1 text-xs text-slate-400">Bấm &quot;Đăng nhập Gemini&quot; để thêm tài khoản đầu tiên</p>
-          <button
-            onClick={openLogin}
-            className="mt-4 rounded-lg bg-blue-600 px-6 py-2 text-sm font-semibold text-white transition hover:bg-blue-700"
-          >
-            Đăng nhập Gemini
-          </button>
+          <p className="mt-1 text-xs text-slate-400">Vào trang VPS, bấm &quot;+ Thêm&quot; để tạo và đăng nhập account</p>
+        </div>
+      ) : filteredAccounts.length === 0 ? (
+        <div className="rounded-xl border border-slate-200 bg-slate-50 py-12 text-center">
+          <p className="text-sm text-slate-500">Không có account nào với trạng thái đã chọn</p>
         </div>
       ) : (
         <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-          {accounts.map((a) => {
+          {filteredAccounts.map((a) => {
             const rateLimited = isRateLimited(a);
-            const cfg = rateLimited ? statusConfig.rate_limited : (statusConfig[a.status] || statusConfig.free);
+            const effStatus = getEffectiveStatus(a);
+            const cfg = statusConfig[effStatus] || statusConfig.free;
             const health = healthResults[a.id];
             return (
               <div
@@ -539,6 +496,18 @@ export default function AdminAccountsPage() {
                 <div className="mb-3 flex items-start justify-between">
                   <div className="min-w-0 flex-1">
                     <p className="truncate text-sm font-semibold text-slate-700">{a.email}</p>
+                    <div className="mt-1 flex items-center gap-2">
+                      {a.vps_name ? (
+                        <span className="inline-flex items-center gap-1 rounded-full bg-indigo-50 px-2 py-0.5 text-xs font-medium text-indigo-700">
+                          <svg className="h-3 w-3" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor">
+                            <path strokeLinecap="round" strokeLinejoin="round" d="M5.25 14.25h13.5m-13.5 0a3 3 0 01-3-3m3 3a3 3 0 100 6h13.5a3 3 0 100-6m-16.5-3a3 3 0 013-3h13.5a3 3 0 013 3m-19.5 0a4.5 4.5 0 01.9-2.7L5.737 5.1a3.375 3.375 0 012.7-1.35h7.126c1.062 0 2.062.5 2.7 1.35l2.587 3.45a4.5 4.5 0 01.9 2.7" />
+                          </svg>
+                          {a.vps_name}
+                        </span>
+                      ) : (
+                        <span className="rounded-full bg-slate-100 px-2 py-0.5 text-xs text-slate-400">Chưa gán VPS</span>
+                      )}
+                    </div>
                     {a.last_used_at && (
                       <p className="mt-0.5 text-xs text-slate-400">
                         Dùng: {formatTime(a.last_used_at)}
@@ -548,12 +517,14 @@ export default function AdminAccountsPage() {
                   <span className={`ml-2 shrink-0 rounded-full px-2.5 py-0.5 text-xs font-medium ${cfg.bg} ${cfg.color}`}>
                     {cfg.icon} {cfg.label}
                   </span>
-                  {rateLimited && (
-                    <div className="mt-1.5 w-full rounded-lg bg-red-50 px-2.5 py-1.5 text-xs text-red-600">
-                      ⏰ {getRateLimitRemaining(a)} — hết hạn lúc {formatTime(a.rate_limited_until)}
-                    </div>
-                  )}
                 </div>
+
+                {/* Rate limited info */}
+                {rateLimited && (
+                  <div className="mb-3 rounded-lg bg-red-50 px-2.5 py-1.5 text-xs text-red-600">
+                    ⏰ {getRateLimitRemaining(a)} — hết hạn lúc {formatTime(a.rate_limited_until)}
+                  </div>
+                )}
 
                 {/* Health result */}
                 {health && (
@@ -569,27 +540,27 @@ export default function AdminAccountsPage() {
                 {/* Actions */}
                 <div className="flex flex-wrap gap-1.5 border-t border-slate-100 pt-3">
                   <button
+                    onClick={() => handleHealthCheck(a.id)}
+                    disabled={checking !== null}
+                    className="rounded-md px-2.5 py-1.5 text-xs font-medium text-purple-600 transition hover:bg-purple-50 disabled:opacity-50"
+                  >
+                    {checking === a.id ? "Đang check..." : "Check Session"}
+                  </button>
+                  {a.vps_id && (a.status === "disabled" || (health && health.status !== "ok")) && (
+                    <button
+                      onClick={() => handleRelogin(a)}
+                      className="rounded-md px-2.5 py-1.5 text-xs font-medium text-amber-600 transition hover:bg-amber-50"
+                    >
+                      🔑 Đăng nhập lại
+                    </button>
+                  )}
+                  <button
                     onClick={() => openEdit(a)}
                     className="rounded-md px-2.5 py-1.5 text-xs font-medium text-blue-600 transition hover:bg-blue-50"
                   >
                     Sửa
                   </button>
-                  <button
-                    onClick={() => handleHealthCheck(a.id)}
-                    disabled={checking !== null}
-                    className="rounded-md px-2.5 py-1.5 text-xs font-medium text-purple-600 transition hover:bg-purple-50 disabled:opacity-50"
-                  >
-                    {checking === a.id ? "Đang check..." : "Check"}
-                  </button>
-                  {healthResults[a.id] && healthResults[a.id].status !== "ok" && (
-                    <button
-                      onClick={() => handleRelogin(a)}
-                      className="rounded-md px-2.5 py-1.5 text-xs font-medium text-amber-600 transition hover:bg-amber-50"
-                    >
-                      Đăng nhập lại
-                    </button>
-                  )}
-                  {a.status !== "free" && a.status !== "disabled" && (
+                  {a.status !== "free" && a.status !== "active" && a.status !== "disabled" && (
                     <button
                       onClick={() => handleReset(a.id)}
                       className="rounded-md px-2.5 py-1.5 text-xs font-medium text-green-600 transition hover:bg-green-50"

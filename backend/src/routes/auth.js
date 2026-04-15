@@ -32,7 +32,7 @@ const router = Router();
  *       401:
  *         description: Sai credentials
  */
-router.post("/login", (req, res) => {
+router.post("/login", async (req, res) => {
   const { username, password } = req.body;
   if (!username || !password) {
     return res.status(400).json({ error: "Username and password required" });
@@ -43,7 +43,7 @@ router.post("/login", (req, res) => {
     return res.status(401).json({ error: "Invalid credentials" });
   }
 
-  const match = bcrypt.compareSync(password, user.password);
+  const match = await bcrypt.compare(password, user.password);
   if (!match) {
     return res.status(401).json({ error: "Invalid credentials" });
   }

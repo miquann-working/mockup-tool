@@ -52,13 +52,13 @@ router.get("/", authMiddleware, adminOnly, (_req, res) => {
  *       409:
  *         description: Username đã tồn tại
  */
-router.post("/", authMiddleware, adminOnly, (req, res) => {
+router.post("/", authMiddleware, adminOnly, async (req, res) => {
   const { username, password, role } = req.body;
   if (!username || !password) {
     return res.status(400).json({ error: "Username and password required" });
   }
   const validRole = role === "admin" ? "admin" : role === "trade" ? "trade" : "mockup";
-  const hash = bcrypt.hashSync(password, 10);
+  const hash = await bcrypt.hash(password, 10);
 
   try {
     const info = db.prepare("INSERT INTO users (username, password, role) VALUES (?, ?, ?)").run(username, hash, validRole);
@@ -126,10 +126,10 @@ router.delete("/:id", authMiddleware, adminOnly, (req, res) => {
  *       200:
  *         description: Đổi mật khẩu thành công
  */
-router.put("/:id/password", authMiddleware, adminOnly, (req, res) => {
+router.put("/:id/password", authMiddleware, adminOnly, async (req, res) => {
   const { password } = req.body;
   if (!password) return res.status(400).json({ error: "Password required" });
-  const hash = bcrypt.hashSync(password, 10);
+  const hash = await bcrypt.hash(password, 10);
   db.prepare("UPDATE users SET password = ? WHERE id = ?").run(hash, Number(req.params.id));
   res.json({ ok: true });
 });

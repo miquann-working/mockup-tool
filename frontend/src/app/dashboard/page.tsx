@@ -117,6 +117,8 @@ function AdminDashboard() {
   const [totalPages, setTotalPages] = useState(1);
   const [filterRole, setFilterRole] = useState("");
   const [filterStatus, setFilterStatus] = useState("");
+  const [filterUser, setFilterUser] = useState("");
+  const [users, setUsers] = useState<{ id: number; username: string; role: string }[]>([]);
   const [showOriginal, setShowOriginal] = useState<string | null>(null);
   const [expandedBatch, setExpandedBatch] = useState<string | null>(null);
 
@@ -124,10 +126,15 @@ function AdminDashboard() {
     api.get("/jobs/admin/stats").then((r) => setStats(r.data)).catch(() => {});
   }, []);
 
+  useEffect(() => {
+    api.get("/users").then((r) => setUsers(r.data)).catch(() => {});
+  }, []);
+
   const fetchJobs = useCallback(() => {
-    const params: Record<string, string | number> = { page, limit: 50 };
+    const params: Record<string, string | number> = { page, limit: 30 };
     if (filterRole) params.role = filterRole;
     if (filterStatus) params.status = filterStatus;
+    if (filterUser) params.user_id = filterUser;
     api
       .get("/jobs", { params })
       .then((res) => {
@@ -137,7 +144,7 @@ function AdminDashboard() {
       })
       .catch(() => {})
       .finally(() => setLoadingJobs(false));
-  }, [page, filterRole, filterStatus]);
+  }, [page, filterRole, filterStatus, filterUser]);
 
   useEffect(() => {
     fetchStats();
@@ -160,10 +167,21 @@ function AdminDashboard() {
     return () => clearInterval(fast);
   }, [hasActiveJobs, fetchJobs]);
 
-  useEffect(() => { setPage(1); }, [filterRole, filterStatus]);
+  useEffect(() => { setPage(1); }, [filterRole, filterStatus, filterUser]);
 
   const handleRetry = async (jobId: number) => {
     try { await api.post(`/jobs/${jobId}/retry`); fetchJobs(); fetchStats(); } catch { alert("Retry thất bại."); }
+  };
+
+  const handleDeleteBatch = async (batchKey: string) => {
+    if (!confirm("Xóa batch này và tất cả ảnh liên quan?")) return;
+    try {
+      await api.delete(`/jobs/batch/${batchKey}`);
+      fetchJobs();
+      fetchStats();
+    } catch {
+      alert("Xóa thất bại.");
+    }
   };
 
   // Group jobs by batch_id
@@ -223,6 +241,12 @@ function AdminDashboard() {
             Tất cả Jobs
           </h2>
           <div className="flex items-center gap-2">
+            <select value={filterUser} onChange={(e) => setFilterUser(e.target.value)} className="rounded-lg border border-slate-300 px-3 py-1.5 text-sm text-slate-600">
+              <option value="">Tất cả user</option>
+              {users.filter((u) => u.role !== "admin").map((u) => (
+                <option key={u.id} value={u.id}>{u.username} ({u.role})</option>
+              ))}
+            </select>
             <select value={filterRole} onChange={(e) => setFilterRole(e.target.value)} className="rounded-lg border border-slate-300 px-3 py-1.5 text-sm text-slate-600">
               <option value="">Tất cả role</option>
               <option value="mockup">Mockup</option>
@@ -279,6 +303,15 @@ function AdminDashboard() {
                       </div>
                       <p className="text-xs text-slate-400">{formatTime(batch.created_at)}</p>
                     </div>
+                    <button
+                      className="shrink-0 rounded-lg p-1.5 text-slate-300 transition hover:bg-red-50 hover:text-red-500"
+                      title="Xóa batch"
+                      onClick={(e) => { e.stopPropagation(); handleDeleteBatch(batch.key); }}
+                    >
+                      <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor">
+                        <path strokeLinecap="round" strokeLinejoin="round" d="M14.74 9l-.346 9m-4.788 0L9.26 9m9.968-3.21c.342.052.682.107 1.022.166m-1.022-.165L18.16 19.673a2.25 2.25 0 01-2.244 2.077H8.084a2.25 2.25 0 01-2.244-2.077L4.772 5.79m14.456 0a48.108 48.108 0 00-3.478-.397m-12 .562c.34-.059.68-.114 1.022-.165m0 0a48.11 48.11 0 013.478-.397m7.5 0v-.916c0-1.18-.91-2.164-2.09-2.201a51.964 51.964 0 00-3.32 0c-1.18.037-2.09 1.022-2.09 2.201v.916m7.5 0a48.667 48.667 0 00-7.5 0" />
+                      </svg>
+                    </button>
                     <svg className={`h-5 w-5 shrink-0 text-slate-400 transition-transform ${isExpanded ? "rotate-180" : ""}`} fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor">
                       <path strokeLinecap="round" strokeLinejoin="round" d="M19.5 8.25l-7.5 7.5-7.5-7.5" />
                     </svg>
@@ -394,10 +427,22 @@ function AdminDashboard() {
 
         {/* Pagination */}
         {totalPages > 1 && (
-          <div className="mt-6 flex items-center justify-center gap-2">
-            <button onClick={() => setPage((p) => Math.max(1, p - 1))} disabled={page <= 1} className="rounded-lg border border-slate-300 px-3 py-1.5 text-sm font-medium text-slate-600 transition hover:bg-slate-50 disabled:opacity-40">← Trước</button>
-            <span className="px-3 text-sm text-slate-500">Trang {page} / {totalPages}</span>
-            <button onClick={() => setPage((p) => Math.min(totalPages, p + 1))} disabled={page >= totalPages} className="rounded-lg border border-slate-300 px-3 py-1.5 text-sm font-medium text-slate-600 transition hover:bg-slate-50 disabled:opacity-40">Sau →</button>
+          <div className="mt-6 flex items-center justify-center gap-1">
+            <button onClick={() => setPage(1)} disabled={page <= 1} className="rounded-lg border border-slate-300 px-2.5 py-1.5 text-sm font-medium text-slate-600 transition hover:bg-slate-50 disabled:opacity-40">«</button>
+            <button onClick={() => setPage((p) => Math.max(1, p - 1))} disabled={page <= 1} className="rounded-lg border border-slate-300 px-3 py-1.5 text-sm font-medium text-slate-600 transition hover:bg-slate-50 disabled:opacity-40">‹</button>
+            {(() => {
+              const pages: number[] = [];
+              const maxVisible = 5;
+              let start = Math.max(1, page - Math.floor(maxVisible / 2));
+              let end = Math.min(totalPages, start + maxVisible - 1);
+              if (end - start + 1 < maxVisible) start = Math.max(1, end - maxVisible + 1);
+              for (let i = start; i <= end; i++) pages.push(i);
+              return pages.map((p) => (
+                <button key={p} onClick={() => setPage(p)} className={`rounded-lg border px-3 py-1.5 text-sm font-medium transition ${p === page ? "border-blue-500 bg-blue-500 text-white" : "border-slate-300 text-slate-600 hover:bg-slate-50"}`}>{p}</button>
+              ));
+            })()}
+            <button onClick={() => setPage((p) => Math.min(totalPages, p + 1))} disabled={page >= totalPages} className="rounded-lg border border-slate-300 px-3 py-1.5 text-sm font-medium text-slate-600 transition hover:bg-slate-50 disabled:opacity-40">›</button>
+            <button onClick={() => setPage(totalPages)} disabled={page >= totalPages} className="rounded-lg border border-slate-300 px-2.5 py-1.5 text-sm font-medium text-slate-600 transition hover:bg-slate-50 disabled:opacity-40">»</button>
           </div>
         )}
 
@@ -633,24 +678,22 @@ function UserDashboard() {
 
           {/* Pagination */}
           {totalPages > 1 && (
-            <div className="mt-6 flex items-center justify-center gap-2">
-              <button
-                onClick={() => setPage((p) => Math.max(1, p - 1))}
-                disabled={page <= 1}
-                className="rounded-lg border border-slate-300 px-3 py-1.5 text-sm font-medium text-slate-600 transition hover:bg-slate-50 disabled:opacity-40"
-              >
-                ← Trước
-              </button>
-              <span className="px-3 text-sm text-slate-500">
-                Trang {page} / {totalPages}
-              </span>
-              <button
-                onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
-                disabled={page >= totalPages}
-                className="rounded-lg border border-slate-300 px-3 py-1.5 text-sm font-medium text-slate-600 transition hover:bg-slate-50 disabled:opacity-40"
-              >
-                Sau →
-              </button>
+            <div className="mt-6 flex items-center justify-center gap-1">
+              <button onClick={() => setPage(1)} disabled={page <= 1} className="rounded-lg border border-slate-300 px-2.5 py-1.5 text-sm font-medium text-slate-600 transition hover:bg-slate-50 disabled:opacity-40">«</button>
+              <button onClick={() => setPage((p) => Math.max(1, p - 1))} disabled={page <= 1} className="rounded-lg border border-slate-300 px-3 py-1.5 text-sm font-medium text-slate-600 transition hover:bg-slate-50 disabled:opacity-40">‹</button>
+              {(() => {
+                const pages: number[] = [];
+                const maxVisible = 5;
+                let start = Math.max(1, page - Math.floor(maxVisible / 2));
+                let end = Math.min(totalPages, start + maxVisible - 1);
+                if (end - start + 1 < maxVisible) start = Math.max(1, end - maxVisible + 1);
+                for (let i = start; i <= end; i++) pages.push(i);
+                return pages.map((p) => (
+                  <button key={p} onClick={() => setPage(p)} className={`rounded-lg border px-3 py-1.5 text-sm font-medium transition ${p === page ? "border-blue-500 bg-blue-500 text-white" : "border-slate-300 text-slate-600 hover:bg-slate-50"}`}>{p}</button>
+                ));
+              })()}
+              <button onClick={() => setPage((p) => Math.min(totalPages, p + 1))} disabled={page >= totalPages} className="rounded-lg border border-slate-300 px-3 py-1.5 text-sm font-medium text-slate-600 transition hover:bg-slate-50 disabled:opacity-40">›</button>
+              <button onClick={() => setPage(totalPages)} disabled={page >= totalPages} className="rounded-lg border border-slate-300 px-2.5 py-1.5 text-sm font-medium text-slate-600 transition hover:bg-slate-50 disabled:opacity-40">»</button>
             </div>
           )}
         </div>

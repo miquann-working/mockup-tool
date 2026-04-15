@@ -30,13 +30,6 @@ interface VpsNode {
   users: VpsUser[];
 }
 
-interface AllAccount {
-  id: number;
-  email: string;
-  status: string;
-  vps_id: number | null;
-}
-
 interface AllUser {
   id: number;
   username: string;
@@ -59,7 +52,8 @@ function timeAgo(dt: string | null | undefined) {
   return `${Math.floor(diff / 3600_000)}h trước`;
 }
 
-type ModalMode = null | "add" | "edit" | "assign-accounts" | "assign-users" | "view-key";
+type ModalMode = null | "add" | "edit" | "assign-accounts" | "assign-users" | "view-key" | "login" | "add-account";
+type LoginStep = "idle" | "starting" | "active" | "stopping" | "success" | "error";
 
 export default function AdminVpsPage() {
   const [nodes, setNodes] = useState<VpsNode[]>([]);
@@ -75,13 +69,22 @@ export default function AdminVpsPage() {
   const [saving, setSaving] = useState(false);
 
   // Assignment
-  const [allAccounts, setAllAccounts] = useState<AllAccount[]>([]);
   const [allUsers, setAllUsers] = useState<AllUser[]>([]);
   const [selectedIds, setSelectedIds] = useState<number[]>([]);
 
   // View key
   const [viewKey, setViewKey] = useState("");
   const [keyCopied, setKeyCopied] = useState(false);
+
+  // Login management
+  const [loginStep, setLoginStep] = useState<LoginStep>("idle");
+  const [loginEmail, setLoginEmail] = useState("");
+  const [loginVncUrl, setLoginVncUrl] = useState("");
+  const [loginMessage, setLoginMessage] = useState("");
+  const [loginAuthCookies, setLoginAuthCookies] = useState(0);
+
+  // Add account
+  const [newAccountEmail, setNewAccountEmail] = useState("");
 
   const fetchNodes = useCallback(() => {
     api.get("/vps").then((r) => setNodes(r.data)).finally(() => setLoading(false));
@@ -104,6 +107,12 @@ export default function AdminVpsPage() {
     setSelectedIds([]);
     setViewKey("");
     setKeyCopied(false);
+    setLoginStep("idle");
+    setLoginEmail("");
+    setLoginVncUrl("");
+    setLoginMessage("");
+    setLoginAuthCookies(0);
+    setNewAccountEmail("");
   };
 
   const openAdd = () => {
@@ -121,20 +130,7 @@ export default function AdminVpsPage() {
     setModalMode("edit");
   };
 
-  const openAssignAccounts = async (node: VpsNode) => {
-    closeModal();
-    setEditing(node);
-    try {
-      const r = await api.get("/accounts");
-      setAllAccounts(r.data);
-      // Pre-select accounts already assigned to this VPS
-      setSelectedIds(node.accounts.map((a) => a.id));
-    } catch {
-      alert("Không tải được danh sách accounts");
-      return;
-    }
-    setModalMode("assign-accounts");
-  };
+
 
   const openAssignUsers = async (node: VpsNode) => {
     closeModal();
@@ -222,29 +218,6 @@ export default function AdminVpsPage() {
   };
 
   // Assignment handlers
-  const handleSaveAssignAccounts = async () => {
-    if (!editing) return;
-    setSaving(true);
-    try {
-      const currentIds = editing.accounts.map((a) => a.id);
-      const toAssign = selectedIds.filter((id) => !currentIds.includes(id));
-      const toUnassign = currentIds.filter((id) => !selectedIds.includes(id));
-
-      if (toAssign.length > 0) {
-        await api.post(`/vps/${editing.id}/assign-accounts`, { account_ids: toAssign });
-      }
-      if (toUnassign.length > 0) {
-        await api.post(`/vps/${editing.id}/unassign-accounts`, { account_ids: toUnassign });
-      }
-      closeModal();
-      fetchNodes();
-    } catch (err: unknown) {
-      const axiosErr = err as { response?: { data?: { error?: string } } };
-      alert(axiosErr.response?.data?.error || "Gán account thất bại");
-    } finally {
-      setSaving(false);
-    }
-  };
 
   const handleSaveAssignUsers = async () => {
     if (!editing) return;
@@ -280,6 +253,84 @@ export default function AdminVpsPage() {
     await navigator.clipboard.writeText(key);
     setKeyCopied(true);
     setTimeout(() => setKeyCopied(false), 2000);
+  };
+
+  // ── Login handlers ──────────────────────────────────────
+
+  const openLogin = (node: VpsNode, email: string) => {
+    closeModal();
+    setEditing(node);
+    setLoginEmail(email);
+    setModalMode("login");
+  };
+
+  const openAddAccount = (node: VpsNode) => {
+    closeModal();
+    setEditing(node);
+    setModalMode("add-account");
+  };
+
+  const handleAddAccount = async () => {
+    if (!editing || !newAccountEmail.trim()) return;
+    setSaving(true);
+    try {
+      await api.post(`/vps/${editing.id}/add-account`, { email: newAccountEmail.trim() });
+      // After creating, switch to login flow for that account
+      const node = editing;
+      const email = newAccountEmail.trim();
+      closeModal();
+      fetchNodes();
+      // Open login modal for the new account
+      setTimeout(() => openLogin(node, email), 300);
+    } catch (err: unknown) {
+      const axiosErr = err as { response?: { data?: { error?: string } } };
+      alert(axiosErr.response?.data?.error || "Thêm account thất bại");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleLoginStart = async (reset = false) => {
+    if (!editing || !loginEmail) return;
+    setLoginStep("starting");
+    setLoginMessage("");
+    try {
+      const r = await api.post(`/vps/${editing.id}/login/start`, {
+        email: loginEmail,
+        reset,
+      });
+      setLoginVncUrl(r.data.vnc_url);
+      setLoginStep("active");
+      setLoginMessage("Trình duyệt đã mở trên VPS. Hãy đăng nhập Google trong cửa sổ noVNC.");
+    } catch (err: unknown) {
+      const axiosErr = err as { response?: { data?: { error?: string } } };
+      setLoginStep("error");
+      setLoginMessage(axiosErr.response?.data?.error || "Không thể khởi động phiên đăng nhập");
+    }
+  };
+
+  const handleLoginFinish = async () => {
+    if (!editing || !loginEmail) return;
+    setLoginStep("stopping");
+    setLoginMessage("Đang dừng trình duyệt và kiểm tra cookies...");
+    try {
+      const r = await api.post(`/vps/${editing.id}/login/stop`, {
+        email: loginEmail,
+      });
+      if (r.data.ok) {
+        setLoginStep("success");
+        setLoginAuthCookies(r.data.auth_cookies || 0);
+        setLoginMessage(r.data.message || "Đăng nhập thành công!");
+        fetchNodes(); // Refresh to update account status
+      } else {
+        setLoginStep("error");
+        setLoginMessage(r.data.message || "Đăng nhập thất bại — cookies không đủ");
+      }
+    } catch (err: unknown) {
+      const axiosErr = err as { response?: { data?: { error?: string } } };
+      setLoginStep("error");
+      setLoginMessage(axiosErr.response?.data?.error || "Lỗi khi hoàn tất đăng nhập");
+    }
   };
 
   return (
@@ -371,71 +422,6 @@ export default function AdminVpsPage() {
                 className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-semibold text-white transition hover:bg-blue-700 disabled:opacity-50"
               >
                 {saving ? "Đang lưu..." : modalMode === "add" ? "Tạo" : "Lưu"}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Assign accounts modal */}
-      {modalMode === "assign-accounts" && editing && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
-          <div className="w-full max-w-md rounded-xl bg-white p-6 shadow-xl">
-            <h3 className="mb-1 text-lg font-semibold text-slate-800">
-              Gán Accounts → {editing.name}
-            </h3>
-            <p className="mb-4 text-sm text-slate-500">
-              Chọn accounts sẽ chạy trên VPS này
-            </p>
-            <div className="max-h-64 space-y-1 overflow-y-auto rounded-lg border border-slate-200 p-2">
-              {allAccounts.length === 0 ? (
-                <p className="py-4 text-center text-sm text-slate-400">Không có account nào</p>
-              ) : (
-                allAccounts.map((acc) => {
-                  const assignedElsewhere = acc.vps_id && acc.vps_id !== editing.id;
-                  const otherVps = assignedElsewhere ? nodes.find((n) => n.id === acc.vps_id) : null;
-                  return (
-                    <label
-                      key={acc.id}
-                      className={`flex cursor-pointer items-center gap-3 rounded-lg px-3 py-2 transition ${
-                        selectedIds.includes(acc.id) ? "bg-blue-50" : "hover:bg-slate-50"
-                      } ${assignedElsewhere ? "opacity-50" : ""}`}
-                    >
-                      <input
-                        type="checkbox"
-                        checked={selectedIds.includes(acc.id)}
-                        onChange={() => toggleSelect(acc.id)}
-                        disabled={!!assignedElsewhere}
-                        className="h-4 w-4 rounded border-slate-300 text-blue-600 focus:ring-blue-500"
-                      />
-                      <div className="flex-1 min-w-0">
-                        <div className="truncate text-sm font-medium text-slate-700">
-                          {acc.email}
-                        </div>
-                        {assignedElsewhere && (
-                          <div className="text-xs text-amber-600">
-                            Đã gán cho {otherVps?.name || `VPS #${acc.vps_id}`}
-                          </div>
-                        )}
-                      </div>
-                    </label>
-                  );
-                })
-              )}
-            </div>
-            <div className="mt-4 flex justify-end gap-2">
-              <button
-                onClick={closeModal}
-                className="rounded-lg px-4 py-2 text-sm font-medium text-slate-600 transition hover:bg-slate-100"
-              >
-                Hủy
-              </button>
-              <button
-                onClick={handleSaveAssignAccounts}
-                disabled={saving}
-                className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-semibold text-white transition hover:bg-blue-700 disabled:opacity-50"
-              >
-                {saving ? "Đang lưu..." : "Lưu"}
               </button>
             </div>
           </div>
@@ -579,6 +565,195 @@ export default function AdminVpsPage() {
         </div>
       )}
 
+      {/* Add account modal */}
+      {modalMode === "add-account" && editing && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
+          <div className="w-full max-w-md rounded-xl bg-white p-6 shadow-xl">
+            <h3 className="mb-1 text-lg font-semibold text-slate-800">
+              Thêm Account → {editing.name}
+            </h3>
+            <p className="mb-4 text-sm text-slate-500">
+              Nhập email Google, hệ thống sẽ tạo account và mở đăng nhập luôn
+            </p>
+            <div className="mb-4">
+              <label className="mb-1.5 block text-sm font-medium text-slate-600">Email Google</label>
+              <input
+                value={newAccountEmail}
+                onChange={(e) => setNewAccountEmail(e.target.value)}
+                placeholder="yourname@gmail.com"
+                className="w-full rounded-lg border border-slate-300 px-3 py-2.5 text-sm focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500/20"
+                autoFocus
+                onKeyDown={(e) => e.key === "Enter" && handleAddAccount()}
+              />
+            </div>
+            <div className="flex justify-end gap-2">
+              <button
+                onClick={closeModal}
+                className="rounded-lg px-4 py-2 text-sm font-medium text-slate-600 transition hover:bg-slate-100"
+              >
+                Hủy
+              </button>
+              <button
+                onClick={handleAddAccount}
+                disabled={saving || !newAccountEmail.trim()}
+                className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-semibold text-white transition hover:bg-blue-700 disabled:opacity-50"
+              >
+                {saving ? "Đang tạo..." : "Tạo & Đăng nhập"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Login modal */}
+      {modalMode === "login" && editing && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
+          <div className="w-full max-w-md rounded-xl bg-white p-6 shadow-xl">
+            <h3 className="mb-1 text-lg font-semibold text-slate-800">
+              Đăng nhập trên {editing.name}
+            </h3>
+            <p className="mb-4 text-sm text-slate-500">
+              Account: <strong>{loginEmail}</strong>
+            </p>
+
+            {/* Step: Idle — show start buttons */}
+            {loginStep === "idle" && (
+              <div className="space-y-3">
+                <p className="text-sm text-slate-600">
+                  Nhấn &quot;Bắt đầu&quot; để mở trình duyệt trên VPS. Sau đó đăng nhập Google qua noVNC.
+                </p>
+                <div className="flex gap-2">
+                  <button
+                    onClick={() => handleLoginStart(false)}
+                    className="flex-1 rounded-lg bg-blue-600 px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-blue-700"
+                  >
+                    ▶ Bắt đầu đăng nhập
+                  </button>
+                  <button
+                    onClick={() => handleLoginStart(true)}
+                    className="rounded-lg border border-amber-300 bg-amber-50 px-3 py-2.5 text-sm font-medium text-amber-700 transition hover:bg-amber-100"
+                    title="Xóa cookies cũ và đăng nhập lại từ đầu"
+                  >
+                    🔄 Reset
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* Step: Starting */}
+            {loginStep === "starting" && (
+              <div className="flex items-center gap-3 py-4">
+                <div className="h-5 w-5 animate-spin rounded-full border-2 border-blue-600 border-t-transparent" />
+                <span className="text-sm text-slate-600">Đang khởi động trình duyệt trên VPS...</span>
+              </div>
+            )}
+
+            {/* Step: Active — show noVNC link + finish button */}
+            {loginStep === "active" && (
+              <div className="space-y-4">
+                <div className="rounded-lg border border-green-200 bg-green-50 p-3">
+                  <p className="mb-2 text-sm font-medium text-green-800">
+                    ✅ Trình duyệt đã sẵn sàng
+                  </p>
+                  <p className="text-xs text-green-700">
+                    {loginMessage}
+                  </p>
+                </div>
+
+                <a
+                  href={loginVncUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="flex items-center justify-center gap-2 rounded-lg bg-indigo-600 px-4 py-3 text-sm font-semibold text-white transition hover:bg-indigo-700"
+                >
+                  🖥 Mở noVNC để đăng nhập
+                  <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M13.5 6H5.25A2.25 2.25 0 003 8.25v10.5A2.25 2.25 0 005.25 21h10.5A2.25 2.25 0 0018 18.75V10.5m-10.5 6L21 3m0 0h-5.25M21 3v5.25" />
+                  </svg>
+                </a>
+
+                <div className="rounded-lg border border-amber-200 bg-amber-50 p-3">
+                  <p className="text-xs text-amber-700 leading-relaxed">
+                    <strong>Lưu ý:</strong> Sau khi đăng nhập xong trên noVNC, quay lại đây nhấn &quot;Hoàn tất&quot;.
+                    Đừng đóng modal này khi chưa hoàn tất.
+                  </p>
+                </div>
+
+                <button
+                  onClick={handleLoginFinish}
+                  className="w-full rounded-lg bg-green-600 px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-green-700"
+                >
+                  ✅ Hoàn tất đăng nhập
+                </button>
+              </div>
+            )}
+
+            {/* Step: Stopping */}
+            {loginStep === "stopping" && (
+              <div className="flex items-center gap-3 py-4">
+                <div className="h-5 w-5 animate-spin rounded-full border-2 border-green-600 border-t-transparent" />
+                <span className="text-sm text-slate-600">{loginMessage}</span>
+              </div>
+            )}
+
+            {/* Step: Success */}
+            {loginStep === "success" && (
+              <div className="space-y-3">
+                <div className="rounded-lg border border-green-200 bg-green-50 p-4 text-center">
+                  <p className="text-2xl mb-1">🎉</p>
+                  <p className="text-sm font-semibold text-green-800">{loginMessage}</p>
+                  <p className="mt-1 text-xs text-green-600">
+                    Auth cookies: {loginAuthCookies}/6
+                  </p>
+                </div>
+                <button
+                  onClick={closeModal}
+                  className="w-full rounded-lg bg-blue-600 px-4 py-2 text-sm font-semibold text-white transition hover:bg-blue-700"
+                >
+                  Đóng
+                </button>
+              </div>
+            )}
+
+            {/* Step: Error */}
+            {loginStep === "error" && (
+              <div className="space-y-3">
+                <div className="rounded-lg border border-red-200 bg-red-50 p-4">
+                  <p className="text-sm font-semibold text-red-800">❌ Thất bại</p>
+                  <p className="mt-1 text-xs text-red-600">{loginMessage}</p>
+                </div>
+                <div className="flex gap-2">
+                  <button
+                    onClick={() => setLoginStep("idle")}
+                    className="flex-1 rounded-lg bg-blue-600 px-4 py-2 text-sm font-semibold text-white transition hover:bg-blue-700"
+                  >
+                    Thử lại
+                  </button>
+                  <button
+                    onClick={closeModal}
+                    className="rounded-lg px-4 py-2 text-sm font-medium text-slate-600 transition hover:bg-slate-100"
+                  >
+                    Đóng
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* Close button (only when idle or active) */}
+            {(loginStep === "idle" || loginStep === "active") && (
+              <div className="mt-4 flex justify-end">
+                <button
+                  onClick={closeModal}
+                  className="rounded-lg px-4 py-2 text-sm font-medium text-slate-600 transition hover:bg-slate-100"
+                >
+                  Hủy
+                </button>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
       {/* Main content */}
       {loading ? (
         <div className="flex justify-center py-12">
@@ -629,12 +804,6 @@ export default function AdminVpsPage() {
                     🔑 Key
                   </button>
                   <button
-                    onClick={() => openAssignAccounts(node)}
-                    className="rounded px-2.5 py-1.5 text-xs font-medium text-blue-600 transition hover:bg-blue-50"
-                  >
-                    Gán Accounts
-                  </button>
-                  <button
                     onClick={() => openAssignUsers(node)}
                     className="rounded px-2.5 py-1.5 text-xs font-medium text-purple-600 transition hover:bg-purple-50"
                   >
@@ -659,9 +828,17 @@ export default function AdminVpsPage() {
               <div className="grid grid-cols-2 gap-4 px-5 py-4">
                 {/* Accounts */}
                 <div>
-                  <h4 className="mb-2 text-xs font-semibold uppercase tracking-wider text-slate-400">
-                    Accounts ({node.accounts.length})
-                  </h4>
+                  <div className="mb-2 flex items-center justify-between">
+                    <h4 className="text-xs font-semibold uppercase tracking-wider text-slate-400">
+                      Accounts ({node.accounts.length})
+                    </h4>
+                    <button
+                      onClick={() => openAddAccount(node)}
+                      className="rounded px-2 py-0.5 text-xs font-medium text-blue-600 transition hover:bg-blue-50"
+                    >
+                      + Thêm
+                    </button>
+                  </div>
                   {node.accounts.length === 0 ? (
                     <p className="text-xs text-slate-400 italic">Chưa gán account nào</p>
                   ) : (
@@ -669,13 +846,26 @@ export default function AdminVpsPage() {
                       {node.accounts.map((acc) => (
                         <div key={acc.id} className="flex items-center justify-between rounded-lg bg-slate-50 px-3 py-1.5">
                           <span className="truncate text-sm text-slate-700">{acc.email}</span>
-                          <span className={`rounded-full px-2 py-0.5 text-xs font-medium ${
-                            acc.status === "free" ? "bg-green-100 text-green-700" :
-                            acc.status === "busy" ? "bg-blue-100 text-blue-700" :
-                            "bg-slate-100 text-slate-600"
-                          }`}>
-                            {acc.status}
-                          </span>
+                          <div className="flex items-center gap-1.5">
+                            <button
+                              onClick={() => openLogin(node, acc.email)}
+                              className="rounded px-2 py-0.5 text-xs font-medium text-indigo-600 transition hover:bg-indigo-50"
+                              title="Đăng nhập Gemini trên VPS"
+                            >
+                              🔑 Đăng nhập
+                            </button>
+                            <span className={`rounded-full px-2 py-0.5 text-xs font-medium ${
+                              acc.status === "free" || acc.status === "active" ? "bg-green-100 text-green-700" :
+                              acc.status === "busy" ? "bg-blue-100 text-blue-700" :
+                              acc.status === "disabled" ? "bg-red-100 text-red-700" :
+                              "bg-slate-100 text-slate-600"
+                            }`}>
+                              {acc.status === "disabled" ? "Hết session" :
+                               acc.status === "active" ? "Sẵn sàng" :
+                               acc.status === "free" ? "Sẵn sàng" :
+                               acc.status}
+                            </span>
+                          </div>
                         </div>
                       ))}
                     </div>

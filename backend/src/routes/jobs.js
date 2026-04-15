@@ -143,8 +143,12 @@ router.get("/", authMiddleware, (req, res) => {
     params.push(req.user.id);
   } else {
     // Admin filters
+    if (req.query.user_id) {
+      where = "WHERE jobs.user_id = ?";
+      params.push(Number(req.query.user_id));
+    }
     if (req.query.role === "mockup" || req.query.role === "trade") {
-      where = "WHERE users.role = ?";
+      where += (where ? " AND" : "WHERE") + " users.role = ?";
       params.push(req.query.role);
     }
     if (req.query.status) {
@@ -294,6 +298,80 @@ router.post("/:id/retry", authMiddleware, (req, res) => {
   }
 
   res.json({ ok: true });
+});
+
+/**
+ * @swagger
+ * /api/jobs/batch/{batchKey}:
+ *   delete:
+ *     tags: [Jobs]
+ *     summary: Xóa toàn bộ batch (admin hoặc chủ sở hữu)
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: batchKey
+ *         required: true
+ *         schema:
+ *           type: string
+ *     responses:
+ *       200:
+ *         description: Batch đã xóa
+ */
+router.delete("/batch/:batchKey", authMiddleware, (req, res) => {
+  const { batchKey } = req.params;
+  const fs = require("fs");
+
+  let jobs;
+  // single_<id> → single job without batch_id
+  if (batchKey.startsWith("single_")) {
+    const jobId = Number(batchKey.replace("single_", ""));
+    const job = db.prepare("SELECT * FROM jobs WHERE id = ? AND batch_id IS NULL").get(jobId);
+    if (!job) return res.status(404).json({ error: "Job not found" });
+    jobs = [job];
+  } else {
+    jobs = db.prepare("SELECT * FROM jobs WHERE batch_id = ?").all(batchKey);
+    if (jobs.length === 0) return res.status(404).json({ error: "Batch not found" });
+  }
+
+  // Permission check
+  if (req.user.role !== "admin" && jobs[0].user_id !== req.user.id) {
+    return res.status(403).json({ error: "Access denied" });
+  }
+
+  // Don't allow deleting while jobs are actively processing
+  if (jobs.some((j) => j.status === "processing")) {
+    return res.status(400).json({ error: "Không thể xóa batch đang xử lý" });
+  }
+
+  const uploadsDir = path.join(__dirname, "../../../uploads");
+  const outputsDir = path.join(__dirname, "../../../outputs");
+
+  // Clean up files
+  const seenImages = new Set();
+  for (const job of jobs) {
+    // Delete output image
+    if (job.mockup_image) {
+      const outPath = path.join(outputsDir, job.mockup_image);
+      try { fs.unlinkSync(outPath); } catch {}
+    }
+    // Delete original image (once per batch — shared)
+    if (job.original_image && !seenImages.has(job.original_image)) {
+      seenImages.add(job.original_image);
+      const origPath = path.join(uploadsDir, job.original_image);
+      try { fs.unlinkSync(origPath); } catch {}
+    }
+  }
+
+  // Delete from DB
+  if (batchKey.startsWith("single_")) {
+    db.prepare("DELETE FROM jobs WHERE id = ?").run(jobs[0].id);
+  } else {
+    db.prepare("DELETE FROM jobs WHERE batch_id = ?").run(batchKey);
+  }
+
+  console.log(`[Jobs] Deleted batch ${batchKey} (${jobs.length} jobs)`);
+  res.json({ ok: true, deleted: jobs.length });
 });
 
 module.exports = router;

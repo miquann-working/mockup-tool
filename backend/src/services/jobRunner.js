@@ -539,7 +539,10 @@ async function processBatchJobs(jobIds, accountId, batchKey) {
 
     try {
       const jobIdsForVps = jobDataList.map((d) => d.job.id);
-      await syncCookiesToVps(vpsNode, account.cookie_dir);
+      const syncOk = await syncCookiesToVps(vpsNode, account.cookie_dir);
+      if (!syncOk) {
+        throw new Error(`Cookie sync failed for ${path.basename(account.cookie_dir)} → ${vpsNode.name}`);
+      }
       await dispatchBatchToVps(vpsNode, {
         cookieDir: account.cookie_dir,
         imagePath: path.resolve(__dirname, "../../../uploads", jobDataList[0].job.original_image),
@@ -797,7 +800,10 @@ async function processJob(jobId, accountId) {
 
     const batchKey = getBatchKey(jobId);
     try {
-      await syncCookiesToVps(vpsNode, account.cookie_dir);
+      const syncOk = await syncCookiesToVps(vpsNode, account.cookie_dir);
+      if (!syncOk) {
+        throw new Error(`Cookie sync failed for ${path.basename(account.cookie_dir)} → ${vpsNode.name}`);
+      }
       await dispatchSingleToVps(vpsNode, {
         jobId,
         cookieDir: account.cookie_dir,
@@ -906,11 +912,26 @@ async function processJob(jobId, accountId) {
 function handleVpsCallback(data) {
   const { type, job_id, batch_key, output_file, error } = data;
 
+  // Auto-detect session expired and disable account immediately
+  if (error && /session.expired|not.logged.in/i.test(error)) {
+    const batch = batch_key ? batches.get(batch_key) : null;
+    if (batch && batch.accountId) {
+      console.warn(`[VPS] Session expired detected for account #${batch.accountId}, disabling`);
+      db.prepare("UPDATE gemini_accounts SET status = 'disabled' WHERE id = ?").run(batch.accountId);
+    }
+  }
+
   switch (type) {
     case "starting":
       if (job_id) {
-        updateJob(job_id, { status: "processing" });
-        console.log(`[VPS] Job ${job_id} processing`);
+        // Guard against race condition: don't overwrite terminal status
+        const currentJob = db.prepare("SELECT status FROM jobs WHERE id = ?").get(job_id);
+        if (currentJob && currentJob.status === "done") {
+          console.log(`[VPS] Job ${job_id} starting callback ignored (already done)`);
+        } else {
+          updateJob(job_id, { status: "processing" });
+          console.log(`[VPS] Job ${job_id} processing`);
+        }
       }
       break;
 

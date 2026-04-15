@@ -9,6 +9,8 @@ const { handleVpsCallback } = require("../services/jobRunner");
 
 const COOKIES_DIR = path.resolve(__dirname, "../../../cookies");
 
+const SAFE_EMAIL_RE = /^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$/;
+
 const router = Router();
 
 // ── Helper ──────────────────────────────────────────────────
@@ -425,6 +427,9 @@ router.get("/cookies-tar/:email", (req, res) => {
   if (!node) return res.status(401).json({ error: "Invalid API key" });
 
   const email = path.basename(req.params.email); // sanitize
+  if (!SAFE_EMAIL_RE.test(email)) {
+    return res.status(400).json({ error: "Invalid email format" });
+  }
   const cookieDir = path.join(COOKIES_DIR, email);
   if (!fs.existsSync(cookieDir)) {
     return res.status(404).json({ error: `Cookie dir not found: ${email}` });
@@ -494,6 +499,217 @@ router.post("/job-callback", (req, res) => {
   handleVpsCallback(req.body);
 
   res.json({ ok: true });
+});
+
+// ── Quick add account to VPS ────────────────────────────────
+
+/**
+ * @swagger
+ * /api/vps/{id}/add-account:
+ *   post:
+ *     tags: [VPS Nodes]
+ *     summary: Tạo account mới và gán vào VPS này (admin only)
+ */
+router.post("/:id/add-account", authMiddleware, adminOnly, (req, res) => {
+  const vpsId = Number(req.params.id);
+  const node = db.prepare("SELECT * FROM vps_nodes WHERE id = ?").get(vpsId);
+  if (!node) return res.status(404).json({ error: "VPS not found" });
+
+  const { email } = req.body;
+  if (!email || !email.trim()) return res.status(400).json({ error: "email required" });
+
+  const trimmedEmail = email.trim();
+  const cookieDir = `cookies/${trimmedEmail}`;
+
+  // Check if account already exists
+  const existing = db.prepare("SELECT id, vps_id FROM gemini_accounts WHERE email = ?").get(trimmedEmail);
+  if (existing) {
+    if (existing.vps_id && existing.vps_id !== vpsId) {
+      const otherVps = db.prepare("SELECT name FROM vps_nodes WHERE id = ?").get(existing.vps_id);
+      return res.status(409).json({ error: `Account đã gán cho ${otherVps?.name || `VPS #${existing.vps_id}`}` });
+    }
+    // Already exists — just assign to this VPS
+    db.prepare("UPDATE gemini_accounts SET vps_id = ? WHERE id = ?").run(vpsId, existing.id);
+    return res.json({ id: existing.id, email: trimmedEmail, created: false, message: "Account đã tồn tại, đã gán vào VPS" });
+  }
+
+  // Create new account + assign
+  const info = db
+    .prepare("INSERT INTO gemini_accounts (email, cookie_dir, vps_id, user_id) VALUES (?, ?, ?, ?)")
+    .run(trimmedEmail, cookieDir, vpsId, req.user.id);
+
+  res.status(201).json({ id: info.lastInsertRowid, email: trimmedEmail, created: true, message: "Đã tạo và gán account" });
+});
+
+// ── VPS Login Management (proxy to VPS agent) ──────────────
+
+function getVpsBaseUrl(node) {
+  return node.host.startsWith("http")
+    ? node.host.replace(/\/+$/, "")
+    : `http://${node.host}:${node.port}`;
+}
+
+/**
+ * @swagger
+ * /api/vps/{id}/login/start:
+ *   post:
+ *     tags: [VPS Nodes]
+ *     summary: Bắt đầu phiên đăng nhập trên VPS (admin only)
+ */
+router.post("/:id/login/start", authMiddleware, adminOnly, async (req, res) => {
+  const node = db.prepare("SELECT * FROM vps_nodes WHERE id = ?").get(req.params.id);
+  if (!node) return res.status(404).json({ error: "VPS not found" });
+
+  const { email, reset } = req.body;
+  if (!email) return res.status(400).json({ error: "email required" });
+
+  // Verify account belongs to this VPS
+  const account = db.prepare(
+    "SELECT id FROM gemini_accounts WHERE email = ? AND vps_id = ?"
+  ).get(email, node.id);
+  if (!account) return res.status(400).json({ error: "Account not assigned to this VPS" });
+
+  try {
+    const baseUrl = getVpsBaseUrl(node);
+    const resp = await fetch(`${baseUrl}/agent/login/start`, {
+      method: "POST",
+      headers: { "X-Api-Key": node.secret_key, "Content-Type": "application/json" },
+      body: JSON.stringify({ email, reset: !!reset }),
+      signal: AbortSignal.timeout(15_000),
+    });
+    const data = await resp.json();
+    if (!resp.ok) return res.status(resp.status).json(data);
+
+    // Override vnc_url with the VPS host (agent returns local IP)
+    const vpsHost = node.host.replace(/^https?:\/\//, "").replace(/:\d+$/, "");
+    data.vnc_url = `http://${vpsHost}:6080/vnc.html`;
+
+    res.json(data);
+  } catch (err) {
+    console.error(`[VPS ${node.name}] Login start error:`, err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * @swagger
+ * /api/vps/{id}/login/stop:
+ *   post:
+ *     tags: [VPS Nodes]
+ *     summary: Dừng phiên đăng nhập, verify cookies, push về backend (admin only)
+ */
+router.post("/:id/login/stop", authMiddleware, adminOnly, async (req, res) => {
+  const node = db.prepare("SELECT * FROM vps_nodes WHERE id = ?").get(req.params.id);
+  if (!node) return res.status(404).json({ error: "VPS not found" });
+
+  const { email } = req.body;
+  if (!email) return res.status(400).json({ error: "email required" });
+
+  const baseUrl = getVpsBaseUrl(node);
+
+  try {
+    // 1) Stop login session
+    const stopResp = await fetch(`${baseUrl}/agent/login/stop`, {
+      method: "POST",
+      headers: { "X-Api-Key": node.secret_key, "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+      signal: AbortSignal.timeout(30_000),
+    });
+    const stopData = await stopResp.json();
+    console.log(`[VPS ${node.name}] Login stop: ${JSON.stringify(stopData)}`);
+
+    // 2) Verify cookies
+    const verifyResp = await fetch(`${baseUrl}/agent/login/verify`, {
+      method: "POST",
+      headers: { "X-Api-Key": node.secret_key, "Content-Type": "application/json" },
+      body: JSON.stringify({ email }),
+      signal: AbortSignal.timeout(15_000),
+    });
+    const verifyData = await verifyResp.json();
+    console.log(`[VPS ${node.name}] Login verify: ${JSON.stringify(verifyData)}`);
+
+    // 3) Pull fresh cookies from VPS to backend
+    let pullOk = false;
+    if (verifyData.ok) {
+      try {
+        const safeEmail = path.basename(email);
+        const cookieDir = path.join(COOKIES_DIR, safeEmail);
+
+        // Clean stale files on backend before pulling
+        const exportedJson = path.join(cookieDir, "exported_cookies.json");
+        try { if (fs.existsSync(exportedJson)) fs.unlinkSync(exportedJson); } catch {}
+
+        // Fetch tar from VPS agent
+        const tarResp = await fetch(
+          `${baseUrl}/agent/login/cookies-upload?email=${encodeURIComponent(safeEmail)}`,
+          {
+            method: "POST",
+            headers: { "X-Api-Key": node.secret_key },
+            signal: AbortSignal.timeout(30_000),
+          }
+        );
+
+        if (tarResp.ok) {
+          const arrayBuf = await tarResp.arrayBuffer();
+          const tmpTar = path.join(COOKIES_DIR, `_tmp_${safeEmail}.tar`);
+          fs.writeFileSync(tmpTar, Buffer.from(arrayBuf));
+          await tar.extract({ file: tmpTar, cwd: COOKIES_DIR });
+          fs.unlinkSync(tmpTar);
+          pullOk = true;
+          console.log(`[VPS ${node.name}] Cookies pulled to backend for ${safeEmail}`);
+
+          // Update account status to active
+          db.prepare("UPDATE gemini_accounts SET status = 'active' WHERE email = ?").run(email);
+        } else {
+          console.warn(`[VPS ${node.name}] Cookie pull failed: ${tarResp.status}`);
+        }
+      } catch (pullErr) {
+        console.error(`[VPS ${node.name}] Cookie pull error:`, pullErr.message);
+      }
+    }
+
+    res.json({
+      ok: verifyData.ok,
+      auth_cookies: verifyData.auth_cookies || 0,
+      cookies_pulled: pullOk,
+      message: verifyData.ok
+        ? `Đăng nhập thành công (${verifyData.auth_cookies}/6 auth cookies)${pullOk ? ", cookies đã đồng bộ" : ""}`
+        : `Đăng nhập thất bại: ${verifyData.message || "Không đủ auth cookies"}`,
+    });
+  } catch (err) {
+    console.error(`[VPS ${node.name}] Login stop error:`, err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * @swagger
+ * /api/vps/{id}/login/verify:
+ *   post:
+ *     tags: [VPS Nodes]
+ *     summary: Kiểm tra cookies đăng nhập trên VPS (admin only)
+ */
+router.post("/:id/login/verify", authMiddleware, adminOnly, async (req, res) => {
+  const node = db.prepare("SELECT * FROM vps_nodes WHERE id = ?").get(req.params.id);
+  if (!node) return res.status(404).json({ error: "VPS not found" });
+
+  const { email } = req.body;
+  if (!email) return res.status(400).json({ error: "email required" });
+
+  try {
+    const baseUrl = getVpsBaseUrl(node);
+    const resp = await fetch(`${baseUrl}/agent/login/verify`, {
+      method: "POST",
+      headers: { "X-Api-Key": node.secret_key, "Content-Type": "application/json" },
+      body: JSON.stringify({ email }),
+      signal: AbortSignal.timeout(15_000),
+    });
+    const data = await resp.json();
+    res.json(data);
+  } catch (err) {
+    console.error(`[VPS ${node.name}] Login verify error:`, err.message);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // ── Offline detection (runs every 60s) ──────────────────────

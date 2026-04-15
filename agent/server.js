@@ -157,6 +157,39 @@ app.get("/agent/cookies", auth, (_req, res) => {
   res.json(dirs);
 });
 
+// ── Routes: Account health check (verify cookies on this VPS) ───
+
+app.post("/agent/account/health", auth, express.json(), (req, res) => {
+  const { email } = req.body;
+  if (!email) return res.status(400).json({ error: "email required" });
+  const safeEmail = path.basename(email);
+  const cookieDir = path.join(COOKIES_DIR, safeEmail);
+
+  if (!fs.existsSync(cookieDir)) {
+    return res.json({ ok: false, status: "no_cookies", message: "Cookie dir not found on VPS" });
+  }
+
+  // Run verify_login.sh to check actual session validity
+  try {
+    const result = require("child_process").execSync(
+      `bash ${path.join(LOGIN_SCRIPTS_DIR, "verify_login.sh")} ${safeEmail} 2>&1`,
+      { timeout: 15000, encoding: "utf-8" }
+    );
+    const ok = result.includes("Login looks GOOD");
+    const authCount = (result.match(/Auth cookies found: (\d+)/)?.[1]) || "0";
+    log(`[Health] ${safeEmail}: ${ok ? "OK" : "FAIL"} (${authCount}/6 auth cookies)`);
+    res.json({
+      ok,
+      status: ok ? "ok" : "session_expired",
+      auth_cookies: parseInt(authCount),
+      message: ok ? "Session hoạt động bình thường" : "Session hết hạn — cần đăng nhập lại",
+    });
+  } catch (err) {
+    log(`[Health] ${safeEmail} error: ${err.message}`);
+    res.json({ ok: false, status: "error", message: err.message });
+  }
+});
+
 // ── Routes: Cookie sync (pull from main server) ────────────
 
 app.post("/agent/cookies/sync", auth, express.json(), async (req, res) => {
@@ -165,10 +198,20 @@ app.post("/agent/cookies/sync", auth, express.json(), async (req, res) => {
     return res.status(400).json({ error: "emails array required" });
   }
 
+  const force = req.body.force === true;
   const results = {};
   for (const rawEmail of emails) {
     const email = path.basename(rawEmail); // sanitize
     const targetDir = path.join(COOKIES_DIR, email);
+
+    // Skip sync if cookies already exist on VPS (non-destructive)
+    // The VPS has fresh cookies from login; re-syncing with main server's
+    // stale copy would overwrite Google's rotated session tokens.
+    if (!force && fs.existsSync(targetDir)) {
+      results[email] = { ok: true, skipped: true };
+      log(`[CookieSync] ${email} already exists, skipping (use force=true to overwrite)`);
+      continue;
+    }
 
     try {
       // Pull tar stream from main server
@@ -206,6 +249,137 @@ app.post("/agent/cookies/sync", auth, express.json(), async (req, res) => {
   }
 
   res.json({ ok: true, results });
+});
+
+// ── Routes: VPS Login Management (noVNC) ────────────────────
+
+const LOGIN_SCRIPTS_DIR = path.join(BASE_DIR, "..", "automation");
+
+app.post("/agent/login/start", auth, express.json(), (req, res) => {
+  const { email, reset } = req.body;
+  if (!email) return res.status(400).json({ error: "email required" });
+  const safeEmail = path.basename(email);
+
+  // Stop any existing session first
+  try {
+    require("child_process").execSync(
+      `bash ${path.join(LOGIN_SCRIPTS_DIR, "stop_login.sh")} 2>/dev/null`,
+      { timeout: 15000, stdio: "pipe" }
+    );
+  } catch {}
+
+  // Start login session
+  const args = [safeEmail];
+  if (reset) args.push("--reset");
+  const child = spawn("bash", [path.join(LOGIN_SCRIPTS_DIR, "start_login.sh"), ...args], {
+    cwd: BASE_DIR,
+    timeout: 600_000,
+    stdio: ["ignore", "pipe", "pipe"],
+    env: { ...process.env, HOME: process.env.HOME || "/home/mockup" },
+  });
+
+  let stdout = "";
+  child.stdout.on("data", (d) => (stdout += d));
+  child.stderr.on("data", (d) => (stdout += d));
+
+  // Wait a few seconds for noVNC to start
+  setTimeout(() => {
+    // Get local IP for noVNC URL
+    const os = require("os");
+    const nets = os.networkInterfaces();
+    let ip = "localhost";
+    for (const ifaces of Object.values(nets)) {
+      for (const iface of ifaces) {
+        if (iface.family === "IPv4" && !iface.internal) {
+          ip = iface.address;
+          break;
+        }
+      }
+    }
+    const vncUrl = `http://${ip}:6080/vnc.html`;
+    log(`[Login] Started for ${safeEmail}, noVNC: ${vncUrl}`);
+    res.json({ ok: true, vnc_url: vncUrl, message: `noVNC started for ${safeEmail}` });
+  }, 3000);
+
+  child.on("error", (err) => {
+    log(`[Login] Start error: ${err.message}`);
+    if (!res.headersSent) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+});
+
+app.post("/agent/login/stop", auth, express.json(), (req, res) => {
+  try {
+    const result = require("child_process").execSync(
+      `bash ${path.join(LOGIN_SCRIPTS_DIR, "stop_login.sh")} 2>&1`,
+      { timeout: 30000, encoding: "utf-8" }
+    );
+    log(`[Login] Stopped: ${result.trim()}`);
+    res.json({ ok: true, message: result.trim() });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/agent/login/verify", auth, express.json(), (req, res) => {
+  const { email } = req.body;
+  if (!email) return res.status(400).json({ error: "email required" });
+  const safeEmail = path.basename(email);
+
+  try {
+    const result = require("child_process").execSync(
+      `bash ${path.join(LOGIN_SCRIPTS_DIR, "verify_login.sh")} ${safeEmail} 2>&1`,
+      { timeout: 15000, encoding: "utf-8" }
+    );
+    const ok = result.includes("Login looks GOOD");
+    const authCount = (result.match(/Auth cookies found: (\d+)/)?.[1]) || "0";
+    log(`[Login] Verify ${safeEmail}: ${ok ? "OK" : "FAIL"} (${authCount}/6 auth cookies)`);
+    res.json({ ok, auth_cookies: parseInt(authCount), message: result.trim() });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.post("/agent/login/cookies-upload", auth, (req, res) => {
+  // Stream the cookies SQLite file as tar to the requester (backend)
+  const { email } = req.query;
+  if (!email) return res.status(400).json({ error: "email required" });
+  const safeEmail = path.basename(String(email));
+  const cookieDir = path.join(COOKIES_DIR, safeEmail);
+
+  if (!fs.existsSync(cookieDir)) {
+    return res.status(404).json({ error: "Cookie dir not found" });
+  }
+
+  // Delete exported_cookies.json before streaming (not needed on server)
+  const exportedJson = path.join(cookieDir, "exported_cookies.json");
+  try { if (fs.existsSync(exportedJson)) fs.unlinkSync(exportedJson); } catch {}
+
+  // Ensure cookie_platform.txt exists
+  const platformFile = path.join(cookieDir, "cookie_platform.txt");
+  if (!fs.existsSync(platformFile)) {
+    fs.writeFileSync(platformFile, "Linux\n");
+  }
+
+  // Stream tar of essential cookie files (both old and new Chromium paths)
+  const filesToTar = [];
+  const defaultCookies = path.join("Default", "Cookies");
+  const defaultJournal = path.join("Default", "Cookies-journal");
+  const networkCookies = path.join("Default", "Network", "Cookies");
+  const networkJournal = path.join("Default", "Network", "Cookies-journal");
+  if (fs.existsSync(path.join(cookieDir, defaultCookies))) filesToTar.push(path.join(safeEmail, defaultCookies));
+  if (fs.existsSync(path.join(cookieDir, defaultJournal))) filesToTar.push(path.join(safeEmail, defaultJournal));
+  if (fs.existsSync(path.join(cookieDir, networkCookies))) filesToTar.push(path.join(safeEmail, networkCookies));
+  if (fs.existsSync(path.join(cookieDir, networkJournal))) filesToTar.push(path.join(safeEmail, networkJournal));
+  filesToTar.push(path.join(safeEmail, "cookie_platform.txt"));
+
+  if (filesToTar.length < 2) {
+    return res.status(404).json({ error: "No cookies found after login" });
+  }
+
+  res.setHeader("Content-Type", "application/x-tar");
+  tar.create({ cwd: COOKIES_DIR, gzip: false }, filesToTar).pipe(res);
 });
 
 // ── Routes: Output download (fallback) ─────────────────────
