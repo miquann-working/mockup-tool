@@ -180,4 +180,25 @@ try {
   // ignore if already migrated
 }
 
+// ── Migration: add conversation_url to jobs (for regeneration feature) ─────
+try {
+  db.exec(`ALTER TABLE jobs ADD COLUMN conversation_url TEXT`);
+} catch (e) {
+  // column already exists – ignore
+}
+
+// ── Migration: add previous_images to jobs (track old images on regenerate) ─────
+try {
+  db.exec(`ALTER TABLE jobs ADD COLUMN previous_images TEXT`);
+} catch (e) {
+  // column already exists – ignore
+}
+
+// ── Migration: add disabled_at to gemini_accounts (for expiry notifications) ─────
+try {
+  db.exec(`ALTER TABLE gemini_accounts ADD COLUMN disabled_at TEXT`);
+} catch (e) {
+  // column already exists – ignore
+}
+
 module.exports = db;

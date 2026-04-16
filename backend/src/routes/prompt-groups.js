@@ -41,11 +41,16 @@ router.get("/", authMiddleware, (req, res) => {
   let where = "WHERE 1=1";
   const params = [];
 
-  // Role-based filter: mockup users see only mockup groups, trade users see only trade groups, admin sees all
+  // Non-admin: role-based filter + optional own_only filter
   if (req.user.role !== "admin") {
     const userRole = req.user.role === "trade" ? "trade" : "mockup";
     where += " AND pg.role = ?";
     params.push(userRole);
+    // When own_only=1, only show user's own prompt groups (used by dashboard job creation)
+    if (req.query.own_only === "1") {
+      where += " AND pg.user_id = ?";
+      params.push(req.user.id);
+    }
   } else if (req.query.role) {
     where += " AND pg.role = ?";
     params.push(req.query.role);

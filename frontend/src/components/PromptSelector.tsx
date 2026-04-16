@@ -2,7 +2,6 @@
 
 import { useEffect, useState, useMemo } from "react";
 import api from "@/lib/api";
-import { useAuth } from "@/lib/auth";
 
 interface Prompt {
   id: number;
@@ -23,15 +22,13 @@ interface TopicSelectorProps {
 }
 
 export default function TopicSelector({ value, onChange }: TopicSelectorProps) {
-  const { user } = useAuth();
   const [groups, setGroups] = useState<PromptGroup[]>([]);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState("");
-  const [filterOwner, setFilterOwner] = useState("all");
 
   useEffect(() => {
     api
-      .get("/prompt-groups", { params: { limit: 200 } })
+      .get("/prompt-groups", { params: { limit: 200, own_only: 1 } })
       .then((res) => {
         const data = Array.isArray(res.data) ? res.data : res.data.data || [];
         setGroups(data);
@@ -40,29 +37,14 @@ export default function TopicSelector({ value, onChange }: TopicSelectorProps) {
       .finally(() => setLoading(false));
   }, []);
 
-  // Unique owners for the dropdown
-  const owners = useMemo(() => {
-    const map = new Map<number, string>();
-    groups.forEach((g) => {
-      if (g.user_id && g.owner_name) map.set(g.user_id, g.owner_name);
-    });
-    return Array.from(map, ([id, name]) => ({ id, name }));
-  }, [groups]);
-
   const filtered = useMemo(() => {
     let list = groups;
-    if (filterOwner === "mine" && user) {
-      list = list.filter((g) => g.user_id === user.id);
-    } else if (filterOwner !== "all") {
-      const ownerId = Number(filterOwner);
-      list = list.filter((g) => g.user_id === ownerId);
-    }
     if (search.trim()) {
       const q = search.toLowerCase();
       list = list.filter((g) => g.name.toLowerCase().includes(q));
     }
     return list;
-  }, [groups, search, filterOwner, user]);
+  }, [groups, search]);
 
   const selectedGroup = groups.find((g) => g.id === value);
 
@@ -85,21 +67,8 @@ export default function TopicSelector({ value, onChange }: TopicSelectorProps) {
 
   return (
     <div>
-      {/* Filter dropdown + Search row */}
+      {/* Search row */}
       <div className="mb-2 flex items-center gap-2">
-        <select
-          value={filterOwner}
-          onChange={(e) => setFilterOwner(e.target.value)}
-          className="rounded-lg border border-slate-300 bg-white px-2 py-1.5 text-xs font-medium text-slate-700 focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500/20"
-        >
-          <option value="all">Tất cả</option>
-          <option value="mine">Của tôi</option>
-          {owners.map((o) => (
-            user && o.id === user.id ? null : (
-              <option key={o.id} value={o.id}>{o.name}</option>
-            )
-          ))}
-        </select>
         <div className="relative flex-1">
           <svg className="pointer-events-none absolute left-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-400" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor">
             <path strokeLinecap="round" strokeLinejoin="round" d="M21 21l-5.197-5.197m0 0A7.5 7.5 0 105.196 5.196a7.5 7.5 0 0010.607 10.607z" />
@@ -149,14 +118,6 @@ export default function TopicSelector({ value, onChange }: TopicSelectorProps) {
                 }`}>
                   {g.prompts.length} góc
                 </span>
-                {/* Owner – only show for other people's prompts */}
-                {g.owner_name && g.user_id !== user?.id && (
-                  <span className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium ${
-                    selected ? "bg-blue-100 text-blue-600" : "bg-slate-100 text-slate-400"
-                  }`}>
-                    {g.owner_name}
-                  </span>
-                )}
               </button>
             );
           })

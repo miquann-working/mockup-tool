@@ -53,6 +53,37 @@ router.get("/", authMiddleware, adminOnly, (_req, res) => {
   res.json(result);
 });
 
+// ── User-facing routes (any authenticated user) ────────────
+// IMPORTANT: Must be registered BEFORE /:id routes
+
+/**
+ * @swagger
+ * /api/vps/my:
+ *   get:
+ *     tags: [VPS Nodes]
+ *     summary: Lấy VPS được gán cho user hiện tại + accounts của user
+ *     security:
+ *       - bearerAuth: []
+ */
+router.get("/my", authMiddleware, (req, res) => {
+  const user = db.prepare("SELECT vps_id FROM users WHERE id = ?").get(req.user.id);
+  if (!user || !user.vps_id) {
+    return res.json({ node: null, accounts: [] });
+  }
+
+  const node = db.prepare(
+    "SELECT id, name, host, port, status, max_concurrent, last_heartbeat, created_at FROM vps_nodes WHERE id = ?"
+  ).get(user.vps_id);
+  if (!node) return res.json({ node: null, accounts: [] });
+
+  // Show all accounts on this VPS
+  const accounts = db.prepare(
+    "SELECT id, email, status, last_used_at FROM gemini_accounts WHERE vps_id = ?"
+  ).all(node.id);
+
+  res.json({ node, accounts });
+});
+
 /**
  * @swagger
  * /api/vps/{id}:
@@ -178,6 +209,227 @@ router.delete("/:id", authMiddleware, adminOnly, (req, res) => {
   db.prepare("DELETE FROM vps_nodes WHERE id = ?").run(id);
 
   res.json({ ok: true });
+});
+
+// ── User-facing POST routes (must be before /:id routes) ────
+
+/**
+ * @swagger
+ * /api/vps/my/add-account:
+ *   post:
+ *     tags: [VPS Nodes]
+ *     summary: User tự thêm account Gemini vào VPS của mình
+ *     security:
+ *       - bearerAuth: []
+ */
+router.post("/my/add-account", authMiddleware, (req, res) => {
+  const user = db.prepare("SELECT vps_id FROM users WHERE id = ?").get(req.user.id);
+  if (!user || !user.vps_id) {
+    return res.status(400).json({ error: "Bạn chưa được gán VPS nào" });
+  }
+
+  const node = db.prepare("SELECT * FROM vps_nodes WHERE id = ?").get(user.vps_id);
+  if (!node) return res.status(404).json({ error: "VPS not found" });
+
+  const { email } = req.body;
+  if (!email || !email.trim()) return res.status(400).json({ error: "email required" });
+
+  const trimmedEmail = email.trim();
+  if (!SAFE_EMAIL_RE.test(trimmedEmail)) {
+    return res.status(400).json({ error: "Email không hợp lệ" });
+  }
+  const cookieDir = `cookies/${trimmedEmail}`;
+
+  const existing = db.prepare("SELECT id, vps_id, user_id FROM gemini_accounts WHERE email = ?").get(trimmedEmail);
+  if (existing) {
+    if (existing.user_id !== req.user.id) {
+      return res.status(409).json({ error: "Email này đã được người khác sử dụng" });
+    }
+    if (existing.vps_id && existing.vps_id !== node.id) {
+      return res.status(409).json({ error: "Account đã gán cho VPS khác" });
+    }
+    db.prepare("UPDATE gemini_accounts SET vps_id = ? WHERE id = ?").run(node.id, existing.id);
+    return res.json({ id: existing.id, email: trimmedEmail, created: false, message: "Account đã tồn tại, đã gán vào VPS" });
+  }
+
+  const info = db
+    .prepare("INSERT INTO gemini_accounts (email, cookie_dir, vps_id, status, user_id) VALUES (?, ?, ?, 'disabled', ?)")
+    .run(trimmedEmail, cookieDir, node.id, req.user.id);
+
+  res.status(201).json({ id: info.lastInsertRowid, email: trimmedEmail, created: true, message: "Đã tạo và gán account" });
+});
+
+/**
+ * @swagger
+ * /api/vps/my/login/start:
+ *   post:
+ *     tags: [VPS Nodes]
+ *     summary: User bắt đầu đăng nhập Gemini trên VPS của mình
+ *     security:
+ *       - bearerAuth: []
+ */
+router.post("/my/login/start", authMiddleware, async (req, res) => {
+  const user = db.prepare("SELECT vps_id FROM users WHERE id = ?").get(req.user.id);
+  if (!user || !user.vps_id) {
+    return res.status(400).json({ error: "Bạn chưa được gán VPS nào" });
+  }
+
+  const node = db.prepare("SELECT * FROM vps_nodes WHERE id = ?").get(user.vps_id);
+  if (!node) return res.status(404).json({ error: "VPS not found" });
+
+  const { email, reset } = req.body;
+  if (!email) return res.status(400).json({ error: "email required" });
+
+  // Verify account belongs to this VPS
+  const account = db.prepare(
+    "SELECT id FROM gemini_accounts WHERE email = ? AND vps_id = ?"
+  ).get(email, node.id);
+  if (!account) return res.status(400).json({ error: "Account không thuộc VPS này" });
+
+  try {
+    const baseUrl = getVpsBaseUrl(node);
+    const resp = await fetch(`${baseUrl}/agent/login/start`, {
+      method: "POST",
+      headers: { "X-Api-Key": node.secret_key, "Content-Type": "application/json" },
+      body: JSON.stringify({ email, reset: !!reset }),
+      signal: AbortSignal.timeout(15_000),
+    });
+    const data = await resp.json();
+    if (!resp.ok) return res.status(resp.status).json(data);
+
+    const vpsHost = node.host.replace(/^https?:\/\//, "").replace(/:\d+$/, "");
+    data.vnc_url = `http://${vpsHost}:6080/vnc.html`;
+
+    res.json(data);
+  } catch (err) {
+    console.error(`[VPS ${node.name}] User login start error:`, err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * @swagger
+ * /api/vps/my/login/stop:
+ *   post:
+ *     tags: [VPS Nodes]
+ *     summary: User dừng phiên đăng nhập, verify cookies, push về backend
+ *     security:
+ *       - bearerAuth: []
+ */
+router.post("/my/login/stop", authMiddleware, async (req, res) => {
+  const user = db.prepare("SELECT vps_id FROM users WHERE id = ?").get(req.user.id);
+  if (!user || !user.vps_id) {
+    return res.status(400).json({ error: "Bạn chưa được gán VPS nào" });
+  }
+
+  const node = db.prepare("SELECT * FROM vps_nodes WHERE id = ?").get(user.vps_id);
+  if (!node) return res.status(404).json({ error: "VPS not found" });
+
+  const { email } = req.body;
+  if (!email) return res.status(400).json({ error: "email required" });
+
+  // Verify account belongs to this VPS
+  const account = db.prepare(
+    "SELECT id FROM gemini_accounts WHERE email = ? AND vps_id = ?"
+  ).get(email, node.id);
+  if (!account) return res.status(400).json({ error: "Account không thuộc VPS này" });
+
+  const baseUrl = getVpsBaseUrl(node);
+
+  try {
+    // 1) Stop login session
+    const stopResp = await fetch(`${baseUrl}/agent/login/stop`, {
+      method: "POST",
+      headers: { "X-Api-Key": node.secret_key, "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+      signal: AbortSignal.timeout(30_000),
+    });
+    const stopData = await stopResp.json();
+    console.log(`[VPS ${node.name}] User login stop: ${JSON.stringify(stopData)}`);
+
+    // 2) Verify cookies
+    const verifyResp = await fetch(`${baseUrl}/agent/login/verify`, {
+      method: "POST",
+      headers: { "X-Api-Key": node.secret_key, "Content-Type": "application/json" },
+      body: JSON.stringify({ email }),
+      signal: AbortSignal.timeout(15_000),
+    });
+    const verifyData = await verifyResp.json();
+    console.log(`[VPS ${node.name}] User login verify: ${JSON.stringify(verifyData)}`);
+
+    // 3) Pull fresh cookies from VPS to backend
+    let pullOk = false;
+    if (verifyData.ok) {
+      try {
+        const safeEmail = path.basename(email);
+        const cookieDir = path.join(COOKIES_DIR, safeEmail);
+
+        const exportedJson = path.join(cookieDir, "exported_cookies.json");
+        try { if (fs.existsSync(exportedJson)) fs.unlinkSync(exportedJson); } catch {}
+
+        const tarResp = await fetch(
+          `${baseUrl}/agent/login/cookies-upload?email=${encodeURIComponent(safeEmail)}`,
+          {
+            method: "POST",
+            headers: { "X-Api-Key": node.secret_key },
+            signal: AbortSignal.timeout(30_000),
+          }
+        );
+
+        if (tarResp.ok) {
+          const arrayBuf = await tarResp.arrayBuffer();
+          const tmpTar = path.join(COOKIES_DIR, `_tmp_${safeEmail}.tar`);
+          fs.writeFileSync(tmpTar, Buffer.from(arrayBuf));
+          await tar.extract({ file: tmpTar, cwd: COOKIES_DIR });
+          fs.unlinkSync(tmpTar);
+          pullOk = true;
+          console.log(`[VPS ${node.name}] Cookies pulled for ${safeEmail} (user ${req.user.id})`);
+          db.prepare("UPDATE gemini_accounts SET status = 'free', disabled_at = NULL WHERE email = ?").run(email);
+        }
+      } catch (pullErr) {
+        console.error(`[VPS ${node.name}] Cookie pull error:`, pullErr.message);
+      }
+    }
+
+    res.json({
+      ok: verifyData.ok,
+      auth_cookies: verifyData.auth_cookies || 0,
+      cookies_pulled: pullOk,
+      message: verifyData.ok
+        ? `Đăng nhập thành công (${verifyData.auth_cookies}/6 auth cookies)${pullOk ? ", cookies đã đồng bộ" : ""}`
+        : `Đăng nhập thất bại: ${verifyData.message || "Không đủ auth cookies"}`,
+    });
+  } catch (err) {
+    console.error(`[VPS ${node.name}] User login stop error:`, err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * @swagger
+ * /api/vps/my/remove-account:
+ *   post:
+ *     tags: [VPS Nodes]
+ *     summary: User gỡ account khỏi VPS của mình
+ *     security:
+ *       - bearerAuth: []
+ */
+router.post("/my/remove-account", authMiddleware, (req, res) => {
+  const user = db.prepare("SELECT vps_id FROM users WHERE id = ?").get(req.user.id);
+  if (!user || !user.vps_id) {
+    return res.status(400).json({ error: "Bạn chưa được gán VPS nào" });
+  }
+
+  const { account_id } = req.body;
+  if (!account_id) return res.status(400).json({ error: "account_id required" });
+
+  const account = db.prepare(
+    "SELECT id, email FROM gemini_accounts WHERE id = ? AND vps_id = ?"
+  ).get(account_id, user.vps_id);
+  if (!account) return res.status(404).json({ error: "Account không tồn tại trên VPS này" });
+
+  db.prepare("UPDATE gemini_accounts SET vps_id = NULL WHERE id = ?").run(account_id);
+  res.json({ ok: true, message: `Đã gỡ ${account.email} khỏi VPS` });
 });
 
 /**
@@ -535,7 +787,7 @@ router.post("/:id/add-account", authMiddleware, adminOnly, (req, res) => {
 
   // Create new account + assign
   const info = db
-    .prepare("INSERT INTO gemini_accounts (email, cookie_dir, vps_id, user_id) VALUES (?, ?, ?, ?)")
+    .prepare("INSERT INTO gemini_accounts (email, cookie_dir, vps_id, status, user_id) VALUES (?, ?, ?, 'disabled', ?)")
     .run(trimmedEmail, cookieDir, vpsId, req.user.id);
 
   res.status(201).json({ id: info.lastInsertRowid, email: trimmedEmail, created: true, message: "Đã tạo và gán account" });
@@ -658,8 +910,8 @@ router.post("/:id/login/stop", authMiddleware, adminOnly, async (req, res) => {
           pullOk = true;
           console.log(`[VPS ${node.name}] Cookies pulled to backend for ${safeEmail}`);
 
-          // Update account status to active
-          db.prepare("UPDATE gemini_accounts SET status = 'active' WHERE email = ?").run(email);
+          // Update account status to free (session valid)
+          db.prepare("UPDATE gemini_accounts SET status = 'free', disabled_at = NULL WHERE email = ?").run(email);
         } else {
           console.warn(`[VPS ${node.name}] Cookie pull failed: ${tarResp.status}`);
         }

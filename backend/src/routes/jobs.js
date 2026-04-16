@@ -4,7 +4,7 @@ const path = require("path");
 const { v4: uuidv4 } = require("uuid");
 const db = require("../db");
 const { authMiddleware, adminOnly } = require("../middleware/auth");
-const { enqueueJob } = require("../services/jobRunner");
+const { enqueueJob, regenerateJob } = require("../services/jobRunner");
 
 const router = Router();
 
@@ -278,9 +278,15 @@ router.post("/:id/retry", authMiddleware, (req, res) => {
   // If this job belongs to a batch, retry ALL error jobs in the batch together
   if (job.batch_id) {
     const batchErrorJobs = db
-      .prepare("SELECT id FROM jobs WHERE batch_id = ? AND status = 'error' ORDER BY id ASC")
+      .prepare("SELECT id, mockup_image, previous_images, updated_at FROM jobs WHERE batch_id = ? AND status = 'error' ORDER BY id ASC")
       .all(job.batch_id);
     for (const ej of batchErrorJobs) {
+      // Save existing image to previous_images before retrying
+      if (ej.mockup_image) {
+        const prev = ej.previous_images ? JSON.parse(ej.previous_images) : [];
+        prev.push({ image: ej.mockup_image, at: ej.updated_at || new Date().toISOString() });
+        db.prepare("UPDATE jobs SET previous_images = ? WHERE id = ?").run(JSON.stringify(prev), ej.id);
+      }
       db.prepare(
         "UPDATE jobs SET status = 'pending', error = NULL, retry_count = 0, updated_at = datetime('now') WHERE id = ?"
       ).run(ej.id);
@@ -291,6 +297,12 @@ router.post("/:id/retry", authMiddleware, (req, res) => {
     }
     console.log(`[Retry] Batch ${job.batch_id}: retrying ${batchErrorJobs.length} error jobs together`);
   } else {
+    // Save existing image to previous_images before retrying
+    if (job.mockup_image) {
+      const prev = job.previous_images ? JSON.parse(job.previous_images) : [];
+      prev.push({ image: job.mockup_image, at: job.updated_at || new Date().toISOString() });
+      db.prepare("UPDATE jobs SET previous_images = ? WHERE id = ?").run(JSON.stringify(prev), job.id);
+    }
     db.prepare(
       "UPDATE jobs SET status = 'pending', error = NULL, retry_count = 0, updated_at = datetime('now') WHERE id = ?"
     ).run(job.id);
@@ -372,6 +384,108 @@ router.delete("/batch/:batchKey", authMiddleware, (req, res) => {
 
   console.log(`[Jobs] Deleted batch ${batchKey} (${jobs.length} jobs)`);
   res.json({ ok: true, deleted: jobs.length });
+});
+
+// ── Regenerate a single job ─────────────────────────────────
+
+router.post("/:id/regenerate", authMiddleware, async (req, res) => {
+  const jobId = parseInt(req.params.id);
+  const { prompt } = req.body;
+
+  if (!prompt || !prompt.trim()) {
+    return res.status(400).json({ error: "prompt is required" });
+  }
+
+  const job = db.prepare("SELECT * FROM jobs WHERE id = ?").get(jobId);
+  if (!job) return res.status(404).json({ error: "Job not found" });
+
+  // Non-admin users can only regenerate their own jobs
+  if (req.user.role !== "admin" && job.user_id !== req.user.id) {
+    return res.status(403).json({ error: "Forbidden" });
+  }
+
+  if (job.status !== "done") {
+    return res.status(400).json({ error: "Only completed jobs can be regenerated" });
+  }
+
+  if (!job.conversation_url) {
+    return res.status(400).json({ error: "No conversation URL — cannot regenerate" });
+  }
+
+  try {
+    await regenerateJob(jobId, prompt.trim());
+    res.json({ ok: true, message: "Regeneration started" });
+  } catch (err) {
+    console.error(`[Jobs] Regen error for job ${jobId}: ${err.message}`);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Promote a previous image to current ─────────────────────
+router.post("/:id/promote", authMiddleware, (req, res) => {
+  const jobId = parseInt(req.params.id);
+  const { index } = req.body; // index in previous_images array
+
+  const job = db.prepare("SELECT * FROM jobs WHERE id = ?").get(jobId);
+  if (!job) return res.status(404).json({ error: "Job not found" });
+  if (req.user.role !== "admin" && job.user_id !== req.user.id) {
+    return res.status(403).json({ error: "Forbidden" });
+  }
+
+  const prev = job.previous_images ? JSON.parse(job.previous_images) : [];
+  if (typeof index !== "number" || index < 0 || index >= prev.length) {
+    return res.status(400).json({ error: "Invalid image index" });
+  }
+
+  // Swap: current mockup_image goes into previous_images, selected one becomes current
+  const promoted = prev[index];
+  const newPrev = [...prev];
+  newPrev[index] = { image: job.mockup_image, at: job.updated_at || new Date().toISOString() };
+
+  db.prepare(
+    "UPDATE jobs SET mockup_image = ?, previous_images = ?, updated_at = datetime('now') WHERE id = ?"
+  ).run(promoted.image, JSON.stringify(newPrev), jobId);
+
+  res.json({ ok: true });
+});
+
+// ── Multi-image upload (multiple images × 1 prompt group) ───
+router.post("/multi", authMiddleware, upload.array("images", 20), (req, res) => {
+  if (!req.files || req.files.length === 0) {
+    return res.status(400).json({ error: "At least one image required" });
+  }
+  const groupId = Number(req.body.group_id);
+  if (!groupId) return res.status(400).json({ error: "group_id required" });
+
+  const group = db.prepare("SELECT id FROM prompt_groups WHERE id = ?").get(groupId);
+  if (!group) return res.status(404).json({ error: "Prompt group not found" });
+
+  const prompts = db.prepare("SELECT id FROM prompts WHERE group_id = ? ORDER BY id ASC").all(groupId);
+  if (prompts.length === 0) return res.status(400).json({ error: "Group has no prompts" });
+
+  const promptIds = prompts.map((p) => p.id);
+  const insertJob = db.prepare(
+    "INSERT INTO jobs (batch_id, user_id, prompt_id, original_image) VALUES (?, ?, ?, ?)"
+  );
+
+  const allJobs = db.transaction(() => {
+    const results = [];
+    for (const file of req.files) {
+      const batchId = promptIds.length > 1 ? uuidv4() : null;
+      for (const pid of promptIds) {
+        const info = insertJob.run(batchId, req.user.id, pid, file.filename);
+        const job = db.prepare("SELECT * FROM jobs WHERE id = ?").get(info.lastInsertRowid);
+        results.push(job);
+      }
+    }
+    return results;
+  })();
+
+  for (const job of allJobs) {
+    enqueueJob(job.id);
+  }
+
+  res.status(201).json(allJobs);
 });
 
 module.exports = router;

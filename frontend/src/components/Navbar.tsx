@@ -3,10 +3,36 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useAuth } from "@/lib/auth";
+import { useEffect, useRef, useState } from "react";
+import api from "@/lib/api";
 
 export default function Navbar() {
   const { user, logout } = useAuth();
   const pathname = usePathname();
+  const [expiredAlerts, setExpiredAlerts] = useState<{ id: number; email: string }[]>([]);
+  const lastCheckRef = useRef(new Date().toISOString());
+
+  // Poll for expired session alerts (admin only)
+  useEffect(() => {
+    if (!user || user.role !== "admin") return;
+    const check = () => {
+      api.get("/accounts/expired-recent", { params: { since: lastCheckRef.current } })
+        .then((r) => {
+          if (r.data.length > 0) {
+            setExpiredAlerts((prev) => {
+              const existingIds = new Set(prev.map((a) => a.id));
+              const newAlerts = r.data.filter((a: { id: number }) => !existingIds.has(a.id));
+              return [...newAlerts, ...prev].slice(0, 10);
+            });
+          }
+          lastCheckRef.current = new Date().toISOString();
+        })
+        .catch(() => {});
+    };
+    check();
+    const i = setInterval(check, 15_000);
+    return () => clearInterval(i);
+  }, [user]);
 
   if (!user) return null;
 
@@ -19,7 +45,9 @@ export default function Navbar() {
           { href: "/admin/users", label: "Users" },
           { href: "/admin/vps", label: "VPS" },
         ]
-      : []),
+      : [
+          { href: "/vps", label: "VPS" },
+        ]),
   ];
 
   return (
@@ -80,6 +108,31 @@ export default function Navbar() {
           </button>
         </div>
       </div>
+      {/* Session expiry toast notifications */}
+      {expiredAlerts.length > 0 && (
+        <div className="fixed bottom-4 right-4 z-50 flex flex-col gap-2">
+          {expiredAlerts.map((alert) => (
+            <div
+              key={alert.id}
+              className="flex items-center gap-3 rounded-lg border border-red-200 bg-red-50 px-4 py-3 shadow-lg animate-in slide-in-from-right"
+            >
+              <span className="text-lg">⚠️</span>
+              <div>
+                <p className="text-sm font-semibold text-red-800">Session hết hạn</p>
+                <p className="text-xs text-red-600">{alert.email}</p>
+              </div>
+              <button
+                onClick={() => setExpiredAlerts((prev) => prev.filter((a) => a.id !== alert.id))}
+                className="ml-2 rounded p-0.5 text-red-400 hover:bg-red-100 hover:text-red-600"
+              >
+                <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+                </svg>
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
     </nav>
   );
 }

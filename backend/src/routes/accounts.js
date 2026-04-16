@@ -84,9 +84,9 @@ router.post("/", authMiddleware, adminOnly, (req, res) => {
     return res.status(409).json({ error: "Email này đã tồn tại" });
   }
   const info = db
-    .prepare("INSERT INTO gemini_accounts (email, cookie_dir, user_id) VALUES (?, ?, ?)")
+    .prepare("INSERT INTO gemini_accounts (email, cookie_dir, status, user_id) VALUES (?, ?, 'disabled', ?)")
     .run(email, cookie_dir, req.user.id);
-  res.status(201).json({ id: info.lastInsertRowid, email, cookie_dir, status: "free" });
+  res.status(201).json({ id: info.lastInsertRowid, email, cookie_dir, status: "disabled" });
 });
 
 /**
@@ -122,7 +122,44 @@ router.delete("/:id", authMiddleware, adminOnly, (req, res) => {
   const accountId = Number(req.params.id);
   const account = db.prepare("SELECT * FROM gemini_accounts WHERE id = ?").get(accountId);
   if (!account) return res.status(404).json({ error: "Account not found" });
+
+  // Delete cookie directory from disk
+  if (account.cookie_dir) {
+    const cookiePath = path.resolve(__dirname, "../../../", account.cookie_dir);
+    if (fs.existsSync(cookiePath)) {
+      fs.rmSync(cookiePath, { recursive: true, force: true });
+      console.log(`[Delete account] Removed cookies: ${cookiePath}`);
+    }
+  }
+
+  // If account is on a VPS, tell agent to clean up cookies too
+  if (account.vps_id) {
+    const vps = db.prepare("SELECT * FROM vps_nodes WHERE id = ?").get(account.vps_id);
+    if (vps) {
+      const baseUrl = vps.host.startsWith("http") ? vps.host.replace(/\/+$/, "") : `http://${vps.host}:${vps.port}`;
+      fetch(`${baseUrl}/agent/cookies/delete`, {
+        method: "POST",
+        headers: { "X-Api-Key": vps.secret_key, "Content-Type": "application/json" },
+        body: JSON.stringify({ email: account.email }),
+        signal: AbortSignal.timeout(10_000),
+      }).catch((err) => console.warn(`[Delete account] VPS cleanup failed: ${err.message}`));
+    }
+  }
+
+  // Detach account from any jobs referencing it
+  db.prepare("UPDATE jobs SET account_id = NULL WHERE account_id = ?").run(accountId);
+
   db.prepare("DELETE FROM gemini_accounts WHERE id = ?").run(accountId);
+  res.json({ ok: true });
+});
+
+// ── Detach account from VPS (but keep account in system) ──
+router.post("/:id/detach", authMiddleware, adminOnly, (req, res) => {
+  const accountId = Number(req.params.id);
+  const account = db.prepare("SELECT * FROM gemini_accounts WHERE id = ?").get(accountId);
+  if (!account) return res.status(404).json({ error: "Account not found" });
+  if (!account.vps_id) return res.status(400).json({ error: "Account chưa gán VPS" });
+  db.prepare("UPDATE gemini_accounts SET vps_id = NULL WHERE id = ?").run(accountId);
   res.json({ ok: true });
 });
 
@@ -186,9 +223,9 @@ router.post("/:id/health", authMiddleware, adminOnly, async (req, res) => {
 
     // Auto-update DB status based on VPS result
     if (data.status === "session_expired" || data.status === "no_cookies") {
-      db.prepare("UPDATE gemini_accounts SET status = 'disabled' WHERE id = ?").run(accountId);
+      db.prepare("UPDATE gemini_accounts SET status = 'disabled', disabled_at = datetime('now') WHERE id = ?").run(accountId);
     } else if (data.ok && account.status === "disabled") {
-      db.prepare("UPDATE gemini_accounts SET status = 'free' WHERE id = ?").run(accountId);
+      db.prepare("UPDATE gemini_accounts SET status = 'free', disabled_at = NULL WHERE id = ?").run(accountId);
     }
 
     res.json({
@@ -243,9 +280,9 @@ router.post("/health-all", authMiddleware, adminOnly, async (req, res) => {
       const data = await resp.json();
 
       if (data.status === "session_expired" || data.status === "no_cookies") {
-        db.prepare("UPDATE gemini_accounts SET status = 'disabled' WHERE id = ?").run(account.id);
+        db.prepare("UPDATE gemini_accounts SET status = 'disabled', disabled_at = datetime('now') WHERE id = ?").run(account.id);
       } else if (data.ok && account.status === "disabled") {
-        db.prepare("UPDATE gemini_accounts SET status = 'free' WHERE id = ?").run(account.id);
+        db.prepare("UPDATE gemini_accounts SET status = 'free', disabled_at = NULL WHERE id = ?").run(account.id);
       }
 
       return { id: account.id, email: account.email, status: data.ok ? "ok" : "error", message: data.message };
@@ -256,6 +293,17 @@ router.post("/health-all", authMiddleware, adminOnly, async (req, res) => {
 
   const results = await Promise.all(promises);
   res.json(results);
+});
+
+// ── Recently expired accounts (for realtime notifications) ──
+router.get("/expired-recent", authMiddleware, (req, res) => {
+  const since = req.query.since || new Date(Date.now() - 60_000).toISOString();
+  const expired = db.prepare(`
+    SELECT id, email, disabled_at FROM gemini_accounts
+    WHERE status = 'disabled' AND disabled_at IS NOT NULL AND disabled_at > ?
+    ORDER BY disabled_at DESC
+  `).all(since);
+  res.json(expired);
 });
 
 /**
@@ -373,7 +421,7 @@ router.post("/upload", authMiddleware, adminOnly, uploadZip.single("cookies"), (
       res.json({ ok: true, id: existing.id, message: "Cookie cập nhật thành công" });
     } else {
       const info = db
-        .prepare("INSERT INTO gemini_accounts (email, cookie_dir, user_id) VALUES (?, ?, ?)")
+        .prepare("INSERT INTO gemini_accounts (email, cookie_dir, status, user_id) VALUES (?, ?, 'disabled', ?)")
         .run(email, `cookies/${email}`, req.user.id);
       res.status(201).json({ ok: true, id: info.lastInsertRowid, message: "Tài khoản tạo thành công" });
     }

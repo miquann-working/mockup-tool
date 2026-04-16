@@ -35,6 +35,9 @@ IMAGE_STYLE = os.environ.get("IMAGE_STYLE", "Chân dung dịu nhẹ")
 SKIP_IMAGE_TOOL = os.environ.get("SKIP_IMAGE_TOOL", "") == "1"
 HEADLESS = os.environ.get("HEADLESS", "") == "1"
 JOBS_JSON = os.environ.get("JOBS_JSON", "")
+REGEN_MODE = os.environ.get("REGEN_MODE", "") == "1"
+REGEN_CONV_URL = os.environ.get("REGEN_CONV_URL", "")
+REGEN_PROMPT = os.environ.get("REGEN_PROMPT", "")
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "..", "outputs")
 
 GEMINI_URL = "https://gemini.google.com/app"
@@ -150,27 +153,6 @@ def _selector_fail_screenshot(page, func_name, context=""):
         pass
 
 
-def _import_exported_cookies(browser, cookie_dir):
-    """Import plaintext cookies from exported_cookies.json if present.
-
-    When cookies are exported on Windows and used on Linux, Chromium's
-    native encrypted cookie store is incompatible (DPAPI vs keyring).
-    This injects the plaintext cookies via Playwright API to bypass
-    the encryption layer entirely.
-    """
-    json_path = os.path.join(cookie_dir, "exported_cookies.json")
-    if not os.path.isfile(json_path):
-        return
-    try:
-        with open(json_path, "r", encoding="utf-8") as f:
-            cookies = json.load(f)
-        if cookies:
-            browser.add_cookies(cookies)
-            log(f"Imported {len(cookies)} cookies from exported_cookies.json")
-    except Exception as e:
-        log(f"Warning: could not import exported cookies: {e}")
-
-
 def _clear_encrypted_cookies(cookie_dir):
     """Remove Chromium's encrypted cookie files before launch.
 
@@ -236,7 +218,30 @@ def _normalize_cookie_path(cookie_dir):
             log(f"  Copied journal: Default/Cookies-journal → Default/Network/Cookies-journal")
 
 
+def _import_exported_cookies(browser, cookie_dir):
+    """Import plaintext cookies from exported_cookies.json if present.
+
+    When cookies are exported on Windows and used on Linux, Chromium's
+    native encrypted cookie store is incompatible (DPAPI vs keyring).
+    This injects the plaintext cookies via Playwright API to bypass
+    the encryption layer entirely.
+    """
+    json_path = os.path.join(cookie_dir, "exported_cookies.json")
+    if not os.path.isfile(json_path):
+        return
+    try:
+        with open(json_path, "r", encoding="utf-8") as f:
+            cookies = json.load(f)
+        if cookies:
+            browser.add_cookies(cookies)
+            log(f"Imported {len(cookies)} cookies from exported_cookies.json")
+    except Exception as e:
+        log(f"Warning: could not import exported cookies: {e}")
+
+
 def main():
+    if REGEN_MODE:
+        return main_regen()
     if JOBS_JSON:
         return main_batch()
 
@@ -269,6 +274,9 @@ def main():
         _cleanup_chrome_lock(COOKIE_DIR)
         _clear_encrypted_cookies(COOKIE_DIR)
         _normalize_cookie_path(COOKIE_DIR)
+        # --headless=new: Chromium's new headless renders identically to headed mode
+        # We set Playwright headless=False and pass the flag manually to avoid
+        # Playwright's old headless shell which is easily detected.
         _extra_args = []
         _headless = False
         if HEADLESS:
@@ -317,13 +325,34 @@ def main():
 
         # Inject anti-detection script BEFORE any page loads
         browser.add_init_script("""
+            // Override navigator.webdriver to hide automation
             Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+
+            // Ensure window.chrome exists (real Chrome always has this)
             if (!window.chrome) {
                 window.chrome = { runtime: {}, csi: function(){}, loadTimes: function(){} };
             }
-            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-            Object.defineProperty(navigator, 'languages', { get: () => ['vi-VN', 'vi', 'en-US', 'en'] });
+
+            // Override plugins to look like real Chrome
+            Object.defineProperty(navigator, 'plugins', {
+                get: () => [1, 2, 3, 4, 5],
+            });
+
+            // Override languages
+            Object.defineProperty(navigator, 'languages', {
+                get: () => ['vi-VN', 'vi', 'en-US', 'en'],
+            });
+
+            // Fix permissions query for notifications
+            const originalQuery = window.Notification && Notification.permission;
+            if (window.Notification) {
+                Notification.permission = 'default';
+            }
+
+            // Override hardware concurrency to realistic value
             Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 4 });
+
+            // Override deviceMemory
             Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
         """)
 
@@ -417,6 +446,12 @@ def main():
             # ── Step 8: Download via hover + download button ──
             log("Step 8: Downloading generated image...")
             output_filename = _download_via_button(page, resp_before)
+
+            # ── Step 9: Capture conversation URL for regeneration ──
+            conv_url = page.url
+            if conv_url and "/app/" in conv_url:
+                print(f"CONV_URL:{conv_url}", flush=True)
+                log(f"Conversation URL: {conv_url}")
 
             log(f"SUCCESS: {output_filename}")
             print(output_filename)
@@ -561,6 +596,125 @@ def _launch_browser(p):
     except Exception:
         pass
     return browser, page
+
+
+def main_regen():
+    """Regeneration mode: re-open an existing Gemini conversation and regenerate a single image."""
+    global PROMPT_TEXT
+
+    if not REGEN_CONV_URL:
+        log("ERROR: REGEN_CONV_URL not set")
+        sys.exit(1)
+    if not REGEN_PROMPT:
+        log("ERROR: REGEN_PROMPT not set")
+        sys.exit(1)
+    if not COOKIE_DIR:
+        log("ERROR: COOKIE_DIR not set")
+        sys.exit(1)
+    if not IMAGE_PATH or not os.path.isfile(IMAGE_PATH):
+        log(f"ERROR: IMAGE_PATH invalid: {IMAGE_PATH}")
+        sys.exit(1)
+
+    # Override PROMPT_TEXT so helper functions use the regen prompt
+    PROMPT_TEXT = REGEN_PROMPT
+
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        log("ERROR: Playwright not installed")
+        sys.exit(1)
+
+    log("Starting REGEN automation...")
+    log(f"  COOKIE_DIR={COOKIE_DIR}")
+    log(f"  IMAGE_PATH={IMAGE_PATH}")
+    log(f"  CONV_URL={REGEN_CONV_URL}")
+    log(f"  REGEN_PROMPT={REGEN_PROMPT[:80]}...")
+    log(f"  OUTPUT_PREFIX={OUTPUT_PREFIX}")
+
+    with sync_playwright() as p:
+        browser, page = _launch_browser(p)
+
+        try:
+            # ── Step 1: Navigate to existing conversation ──
+            log("Step 1: Navigating to existing conversation...")
+            page.goto(REGEN_CONV_URL, wait_until="domcontentloaded", timeout=30000)
+            page.wait_for_load_state("load", timeout=15000)
+
+            if "accounts.google.com" in page.url or "signin" in page.url:
+                raise Exception("Not logged in — session expired")
+
+            _dismiss_dialogs(page)
+            time.sleep(1.0)
+
+            # ── Step 2: Scroll to bottom of conversation ──
+            log("Step 2: Scrolling to bottom of conversation...")
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            time.sleep(1.0)
+            _dismiss_dialogs(page)
+            human_delay()
+
+            # ── Step 3: Activate "Tạo hình ảnh" tool + style ──
+            if SKIP_IMAGE_TOOL:
+                log("Step 3: [SKIP] Using normal chat mode")
+            else:
+                log("Step 3: Ensuring 'Tạo hình ảnh' is active...")
+                needs_style = _ensure_create_image_active(page)
+                if needs_style:
+                    log(f"  Selecting style '{IMAGE_STYLE}'...")
+                    _select_style(page, IMAGE_STYLE)
+                    time.sleep(0.5)
+
+            # ── Step 4: Clear leftover and upload image ──
+            existing_imgs = _count_input_images(page)
+            if existing_imgs > 0:
+                log(f"Step 4: Clearing {existing_imgs} leftover image(s)...")
+                _clear_input_area(page)
+                time.sleep(0.3)
+            log("Step 4: Uploading image...")
+            _upload_image(page)
+            time.sleep(0.3)
+
+            # ── Step 5: Enter regen prompt ──
+            log("Step 5: Entering regen prompt...")
+            _enter_prompt(page)
+            time.sleep(0.3)
+
+            # ── Step 6: Submit ──
+            resp_before = page.evaluate("document.querySelectorAll('response-element').length")
+            log(f"Step 6: Submitting... (resp_before={resp_before})")
+            _submit_prompt(page)
+
+            # ── Step 7: Wait for generation ──
+            log("Step 7: Waiting for Gemini to generate...")
+            _wait_for_response(page, resp_before)
+
+            # ── Step 8: Download generated image ──
+            log("Step 8: Downloading generated image...")
+            output_filename = _download_via_button(page, resp_before)
+
+            log(f"SUCCESS: {output_filename}")
+            print(output_filename)
+
+        except RateLimitError:
+            log("RATE_LIMITED: Account hit Gemini image generation limit")
+            print("RATE_LIMITED", flush=True)
+            browser.close()
+            sys.exit(2)
+
+        except Exception as e:
+            log(f"ERROR: {e}")
+            try:
+                debug_path = os.path.join(OUTPUT_DIR, f"debug_regen_{OUTPUT_PREFIX}.png")
+                page.screenshot(path=debug_path)
+                log(f"Debug screenshot saved: {debug_path}")
+            except Exception:
+                pass
+            browser.close()
+            sys.exit(1)
+
+        browser.close()
 
 
 def main_batch():
@@ -737,6 +891,12 @@ def main_batch():
                     time.sleep(0.5)
 
             log(f"BATCH SUCCESS: {len(results)}/{len(jobs)} jobs completed")
+
+            # Capture conversation URL for regeneration feature
+            conv_url = page.url
+            if conv_url and "/app/" in conv_url:
+                print(f"CONV_URL:{conv_url}", flush=True)
+                log(f"Conversation URL: {conv_url}")
 
         except RateLimitError:
             log("RATE_LIMITED: Account hit Gemini image generation limit")

@@ -120,10 +120,10 @@ export default function JobCard({
                 onClick={() => {
                   const ext = job.mockup_image!.split(".").pop() || "png";
                   const safeName = (job.prompt_name || `job_${job.id}`).replace(/[<>:"/\\|?*]/g, "_");
-                  downloadSingleImage(`${API_BASE}/outputs/${job.mockup_image}`, `${safeName}.${ext}`);
+                  downloadSingleImage(`${API_BASE}/outputs-hd/${job.mockup_image}?size=2048`, `${safeName}_2K.${ext}`);
                 }}
                 className="absolute bottom-1.5 right-1.5 flex h-7 w-7 items-center justify-center rounded-full bg-white/90 shadow transition hover:bg-white"
-                title="Tải xuống"
+                title="Tải 2K"
               >
                 <svg className="h-4 w-4 text-slate-600" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor">
                   <path strokeLinecap="round" strokeLinejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5M16.5 12L12 16.5m0 0L7.5 12m4.5 4.5V3" />

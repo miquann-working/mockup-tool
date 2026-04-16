@@ -436,7 +436,7 @@ app.post("/agent/execute", auth, upload.single("image"), async (req, res) => {
 async function executeSingleJob(params) {
   const { job_id, cookiePath, imagePath, prompt_text, output_prefix, image_style, skip_image_tool, callback_url, batch_key } = params;
   try {
-    const outputFile = await spawnWorker({
+    const rawOutput = await spawnWorker({
       cookieDir: cookiePath,
       imagePath,
       promptText: prompt_text,
@@ -444,6 +444,18 @@ async function executeSingleJob(params) {
       imageStyle: image_style || "",
       skipImageTool: skip_image_tool === "1" || skip_image_tool === true,
     });
+
+    // Parse output: may contain CONV_URL:xxx and filename
+    let outputFile = null;
+    let convUrl = null;
+    for (const ln of rawOutput.split("\n")) {
+      const t = ln.trim();
+      if (t.startsWith("CONV_URL:")) {
+        convUrl = t.substring(9);
+      } else if (t) {
+        outputFile = t;
+      }
+    }
 
     log(`[Job ${job_id}] Success: ${outputFile}`);
 
@@ -459,6 +471,7 @@ async function executeSingleJob(params) {
       batch_key,
       output_file: outputFile,
       image_base64: imageBase64,
+      conversation_url: convUrl,
     });
   } catch (err) {
     log(`[Job ${job_id}] Error: ${err.message}`);
@@ -468,6 +481,86 @@ async function executeSingleJob(params) {
       batch_key,
       error: err.message,
     }).catch(e => log(`[Job ${job_id}] Callback failed: ${e.message}`));
+  } finally {
+    activeWorkers--;
+    cleanupFile({ path: imagePath });
+  }
+}
+
+// ── Routes: Execute regen (single image regeneration) ───────
+
+app.post("/agent/execute-regen", auth, upload.single("image"), async (req, res) => {
+  if (activeWorkers >= MAX_CONCURRENT) {
+    cleanupFile(req.file);
+    return res.status(503).json({ error: "Agent busy", active: activeWorkers, max: MAX_CONCURRENT });
+  }
+
+  const { job_id, cookie_dir, output_prefix, image_style, skip_image_tool, callback_url, regen_conv_url, regen_prompt } = req.body;
+
+  if (!req.file) {
+    return res.status(400).json({ error: "image file required" });
+  }
+  if (!cookie_dir || !regen_conv_url || !regen_prompt || !output_prefix) {
+    cleanupFile(req.file);
+    return res.status(400).json({ error: "cookie_dir, regen_conv_url, regen_prompt, output_prefix required" });
+  }
+
+  const cookiePath = path.join(COOKIES_DIR, path.basename(cookie_dir));
+  if (!fs.existsSync(cookiePath)) {
+    const synced = await autoSyncCookie(path.basename(cookie_dir));
+    if (!synced) {
+      cleanupFile(req.file);
+      return res.status(400).json({ error: `Cookie dir not found: ${cookie_dir}` });
+    }
+  }
+
+  activeWorkers++;
+  const imagePath = req.file.path;
+  log(`[Regen ${job_id}] Accepted (${activeWorkers}/${MAX_CONCURRENT} workers)`);
+
+  res.status(202).json({ accepted: true, job_id });
+
+  executeRegenJob({
+    job_id, cookiePath, imagePath, output_prefix,
+    image_style, skip_image_tool, callback_url,
+    regen_conv_url, regen_prompt,
+  });
+});
+
+async function executeRegenJob(params) {
+  const { job_id, cookiePath, imagePath, output_prefix, image_style, skip_image_tool, callback_url, regen_conv_url, regen_prompt } = params;
+  try {
+    const outputFile = await spawnRegenWorker({
+      cookieDir: cookiePath,
+      imagePath,
+      outputPrefix: output_prefix,
+      imageStyle: image_style || "",
+      skipImageTool: skip_image_tool === "1" || skip_image_tool === true,
+      regenConvUrl: regen_conv_url,
+      regenPrompt: regen_prompt,
+    });
+
+    log(`[Regen ${job_id}] Success: ${outputFile}`);
+
+    const outputPath = path.join(OUTPUTS_DIR, outputFile);
+    let imageBase64 = null;
+    if (fs.existsSync(outputPath)) {
+      imageBase64 = fs.readFileSync(outputPath).toString("base64");
+    }
+
+    await sendCallback(callback_url, {
+      type: "done",
+      job_id: parseInt(job_id),
+      output_file: outputFile,
+      image_base64: imageBase64,
+    });
+  } catch (err) {
+    log(`[Regen ${job_id}] Error: ${err.message}`);
+    await sendCallback(callback_url, {
+      type: err.rateLimited ? "rate_limited" : "error",
+      job_id: parseInt(job_id),
+      error: err.message,
+    }).catch(e => log(`[Regen ${job_id}] Callback failed: ${e.message}`));
   } finally {
     activeWorkers--;
     cleanupFile({ path: imagePath });
@@ -524,6 +617,7 @@ app.post("/agent/execute-batch", auth, upload.single("image"), async (req, res) 
 async function executeBatchJob(params) {
   const { cookiePath, imagePath, image_style, skip_image_tool, jobs_json, jobIdList, callback_url, batch_key } = params;
   const completedSet = new Set();
+  let batchConvUrl = null;
 
   try {
     await spawnBatchWorker({
@@ -533,6 +627,13 @@ async function executeBatchJob(params) {
       skipImageTool: skip_image_tool === "1" || skip_image_tool === true,
       jobsJson: jobs_json,
       onLine: async (line) => {
+        // CONV_URL:url — conversation URL for regeneration
+        if (line.startsWith("CONV_URL:")) {
+          batchConvUrl = line.substring(9);
+          log(`[Batch ${batch_key}] Conversation URL: ${batchConvUrl}`);
+          return;
+        }
+
         // STARTING:index
         if (line.startsWith("STARTING:")) {
           const idx = parseInt(line.substring(9));
@@ -607,6 +708,7 @@ async function executeBatchJob(params) {
       batch_key,
       completed: [...completedSet].map(i => jobIdList[i]),
       total: jobIdList.length,
+      conversation_url: batchConvUrl,
     }).catch(() => {});
 
   } catch (err) {
@@ -691,6 +793,72 @@ function spawnWorker({ cookieDir, imagePath, promptText, outputPrefix, imageStyl
       const output = stdout.trim();
       if (!output) {
         return reject(new Error("Worker returned empty output"));
+      }
+      resolve(output);
+    });
+
+    child.on("error", (err) => {
+      clearTimeout(timer);
+      if (!settled) { settled = true; reject(err); }
+    });
+  });
+}
+
+// ── Worker: spawn regen ─────────────────────────────────────
+
+function spawnRegenWorker({ cookieDir, imagePath, outputPrefix, imageStyle, skipImageTool, regenConvUrl, regenPrompt }) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+
+    const child = spawn(PYTHON, [SCRIPT], {
+      env: {
+        ...process.env,
+        HEADLESS: "1",
+        COOKIE_DIR: cookieDir,
+        IMAGE_PATH: imagePath,
+        OUTPUT_PREFIX: outputPrefix,
+        IMAGE_STYLE: imageStyle,
+        SKIP_IMAGE_TOOL: skipImageTool ? "1" : "",
+        REGEN_MODE: "1",
+        REGEN_CONV_URL: regenConvUrl,
+        REGEN_PROMPT: regenPrompt,
+      },
+      cwd: BASE_DIR,
+    });
+
+    const timer = setTimeout(() => {
+      if (!settled) {
+        settled = true;
+        child.kill();
+        reject(new Error(`Regen worker timeout after ${WORKER_TIMEOUT_MS / 1000}s`));
+      }
+    }, WORKER_TIMEOUT_MS);
+
+    let stdout = "";
+    let stderr = "";
+
+    child.stdout.on("data", (d) => { stdout += d; });
+    child.stderr.on("data", (d) => {
+      stderr += d;
+      process.stderr.write(d);
+    });
+
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      if (settled) return;
+      settled = true;
+
+      if (code === 2) {
+        const err = new Error("RATE_LIMITED");
+        err.rateLimited = true;
+        return reject(err);
+      }
+      if (code !== 0) {
+        return reject(new Error(`Regen worker exited ${code}: ${stderr.slice(-500)}`));
+      }
+      const output = stdout.trim().split("\n").filter(l => !l.startsWith("CONV_URL:")).pop();
+      if (!output) {
+        return reject(new Error("Regen worker returned empty output"));
       }
       resolve(output);
     });

@@ -2,6 +2,8 @@ require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const path = require("path");
+const fs = require("fs");
+const sharp = require("sharp");
 const rateLimit = require("express-rate-limit");
 const swaggerJsdoc = require("swagger-jsdoc");
 const swaggerUi = require("swagger-ui-express");
@@ -55,6 +57,32 @@ app.use("/api-docs", swaggerUi.serve, swaggerUi.setup(swaggerSpec));
 // Serve uploaded & output files
 app.use("/uploads", express.static(path.join(__dirname, "../../uploads")));
 app.use("/outputs", express.static(path.join(__dirname, "../../outputs")));
+
+// HD upscale endpoint — upscales output images on-the-fly
+app.get("/outputs-hd/:filename", async (req, res) => {
+  const filename = path.basename(req.params.filename); // sanitize
+  const filePath = path.join(__dirname, "../../outputs", filename);
+  if (!fs.existsSync(filePath)) return res.status(404).json({ error: "File not found" });
+
+  const size = parseInt(req.query.size) || 2048;
+  const clampedSize = Math.min(Math.max(size, 1024), 4096);
+
+  try {
+    const ext = path.extname(filename).toLowerCase();
+    const buffer = await sharp(filePath)
+      .resize(clampedSize, clampedSize, { kernel: sharp.kernel.lanczos3, fit: "inside", withoutEnlargement: false })
+      .toFormat(ext === ".png" ? "png" : "jpeg", ext === ".png" ? { compressionLevel: 6 } : { quality: 95 })
+      .toBuffer();
+
+    const hdName = filename.replace(/(\.[^.]+)$/, `_${clampedSize}$1`);
+    res.setHeader("Content-Type", ext === ".png" ? "image/png" : "image/jpeg");
+    res.setHeader("Content-Disposition", `attachment; filename="${hdName}"`);
+    res.send(buffer);
+  } catch (err) {
+    console.error("[Upscale] Error:", err.message);
+    res.status(500).json({ error: "Upscale failed" });
+  }
+});
 
 // Rate limiters
 const loginLimiter = rateLimit({

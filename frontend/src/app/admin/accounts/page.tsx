@@ -84,6 +84,21 @@ export default function AdminAccountsPage() {
 
   useEffect(() => { fetchAccounts(); }, [fetchAccounts]);
 
+  // Auto health-check all accounts on first load to get real session status
+  const [initialChecked, setInitialChecked] = useState(false);
+  useEffect(() => {
+    if (loading || initialChecked || accounts.length === 0) return;
+    setInitialChecked(true);
+    api.post("/accounts/health-all", {}, { timeout: 120000 }).then((r) => {
+      const map: Record<number, { status: string; message?: string }> = {};
+      for (const item of r.data) {
+        map[item.id] = { status: item.status, message: item.message };
+      }
+      setHealthResults(map);
+      fetchAccounts(); // Refresh to get updated statuses
+    }).catch(() => {});
+  }, [loading, initialChecked, accounts.length, fetchAccounts]);
+
   // Auto-refresh accounts every 30s to pick up status changes (e.g. session expired)
   useEffect(() => {
     const interval = setInterval(() => {
@@ -131,9 +146,19 @@ export default function AdminAccountsPage() {
   };
 
   const handleDelete = async (id: number) => {
-    if (!confirm("Xóa tài khoản này?")) return;
+    if (!confirm("Xóa hẳn tài khoản này khỏi hệ thống? Cookie sẽ bị xóa hoàn toàn.")) return;
     await api.delete(`/accounts/${id}`);
     fetchAccounts();
+  };
+
+  const handleDetach = async (id: number) => {
+    if (!confirm("Gỡ tài khoản này khỏi VPS? Account vẫn giữ lại trong hệ thống.")) return;
+    try {
+      await api.post(`/accounts/${id}/detach`);
+      fetchAccounts();
+    } catch {
+      alert("Gỡ VPS thất bại.");
+    }
   };
 
   const handleReset = async (id: number) => {
@@ -554,12 +579,14 @@ export default function AdminAccountsPage() {
                       🔑 Đăng nhập lại
                     </button>
                   )}
-                  <button
-                    onClick={() => openEdit(a)}
-                    className="rounded-md px-2.5 py-1.5 text-xs font-medium text-blue-600 transition hover:bg-blue-50"
-                  >
-                    Sửa
-                  </button>
+                  {a.vps_id && (
+                    <button
+                      onClick={() => handleDetach(a.id)}
+                      className="rounded-md px-2.5 py-1.5 text-xs font-medium text-orange-600 transition hover:bg-orange-50"
+                    >
+                      Gỡ VPS
+                    </button>
+                  )}
                   {a.status !== "free" && a.status !== "active" && a.status !== "disabled" && (
                     <button
                       onClick={() => handleReset(a.id)}
