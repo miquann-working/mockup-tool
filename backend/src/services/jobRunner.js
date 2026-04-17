@@ -1315,6 +1315,7 @@ async function regenerateJob(jobId, regenPrompt) {
         console.log(`[Regen] Job ${jobId} dispatched to VPS ${vpsNode.name} (conversation regen)`);
       } else {
         // No conversation URL → dispatch as fresh single job with modified prompt
+        // Use skipImageTool: isLineDrawing only (same as processJob) — trade needs the image tool
         const freshPrompt = prompt
           ? `${prompt.content}\n\nYêu cầu bổ sung: ${regenPrompt}`
           : regenPrompt;
@@ -1325,7 +1326,7 @@ async function regenerateJob(jobId, regenPrompt) {
           promptText: freshPrompt,
           outputPrefix,
           imageStyle,
-          skipImageTool: isLineDrawing || isTrade,
+          skipImageTool: isLineDrawing,
           batchKey,
         });
         console.log(`[Regen] Job ${jobId} dispatched to VPS ${vpsNode.name} (fresh conversation)`);
