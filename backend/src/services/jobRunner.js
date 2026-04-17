@@ -1267,10 +1267,14 @@ function handleVpsBatchComplete(data) {
 
   console.warn(`[VPS] Batch ${batch_key} retry ${next}/${MAX_BATCH_RETRIES} in ${RETRY_DELAY_SEC}s`);
 
-  // Reset ALL jobs for replay (conversation must be complete)
-  const allIds = allBatchJobs.map((j) => j.id);
-  for (const id of allIds) {
-    updateJob(id, { status: "pending", error, retry_count: next, mockup_image: null });
+  // Only retry jobs that are NOT already done — preserve completed work
+  const retryIds = failedJobs.map((j) => j.id);
+  const doneCount = allBatchJobs.length - failedJobs.length;
+  if (doneCount > 0) {
+    console.log(`[VPS] Batch ${batch_key}: preserving ${doneCount} already-done jobs, retrying ${retryIds.length} failed jobs`);
+  }
+  for (const id of retryIds) {
+    updateJob(id, { status: "pending", error, retry_count: next });
   }
 
   if (accountId) {
@@ -1282,7 +1286,7 @@ function handleVpsBatchComplete(data) {
   pendingRetries.set(batch_key, (pendingRetries.get(batch_key) || 0) + 1);
   setTimeout(() => {
     pendingRetries.set(batch_key, (pendingRetries.get(batch_key) || 1) - 1);
-    for (const id of allIds) {
+    for (const id of retryIds) {
       if (!batch.jobs.includes(id)) batch.jobs.push(id);
     }
     startBatch(batch_key);
