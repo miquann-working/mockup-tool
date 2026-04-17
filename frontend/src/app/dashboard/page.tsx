@@ -554,8 +554,9 @@ function UserDashboard() {
     try {
       await api.post(`/jobs/${jobId}/regenerate`, { prompt });
       fetchJobs();
-    } catch {
-      alert("Tạo lại thất bại.");
+    } catch (err: unknown) {
+      const msg = (err as { response?: { data?: { error?: string } } })?.response?.data?.error || "Tạo lại thất bại.";
+      alert(msg);
     }
   };
 

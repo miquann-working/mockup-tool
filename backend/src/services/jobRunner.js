@@ -1257,6 +1257,11 @@ async function regenerateJob(jobId, regenPrompt) {
   const account = db.prepare("SELECT * FROM gemini_accounts WHERE id = ?").get(job.account_id);
   if (!account) throw new Error("Original account not found");
 
+  // Check if account is currently busy — if so, cannot dispatch regen now
+  if (account.status === "busy" || account.status === "cooldown") {
+    throw new Error("Tài khoản Gemini đang bận, vui lòng chờ job hiện tại xong rồi thử lại");
+  }
+
   // Save current mockup_image to previous_images before regenerating
   if (job.mockup_image) {
     const prev = job.previous_images ? JSON.parse(job.previous_images) : [];
