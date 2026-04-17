@@ -1332,6 +1332,9 @@ async function regenerateJob(jobId, regenPrompt) {
         console.log(`[Regen] Job ${jobId} dispatched to VPS ${vpsNode.name} (fresh conversation)`);
       }
 
+      // Mark as processing immediately after successful dispatch
+      updateJob(jobId, { status: "processing" });
+
       return { dispatched: true };
     } catch (err) {
       updateJob(jobId, { status: "error", error: `Regen dispatch failed: ${err.message}` });

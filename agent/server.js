@@ -436,6 +436,13 @@ app.post("/agent/execute", auth, upload.single("image"), async (req, res) => {
 async function executeSingleJob(params) {
   const { job_id, cookiePath, imagePath, prompt_text, output_prefix, image_style, skip_image_tool, callback_url, batch_key } = params;
   try {
+    // Notify backend that job is processing
+    await sendCallback(callback_url, {
+      type: "starting",
+      job_id: parseInt(job_id),
+      batch_key,
+    }).catch(() => {});
+
     const rawOutput = await spawnWorker({
       cookieDir: cookiePath,
       imagePath,
@@ -530,6 +537,13 @@ app.post("/agent/execute-regen", auth, upload.single("image"), async (req, res) 
 async function executeRegenJob(params) {
   const { job_id, cookiePath, imagePath, output_prefix, image_style, skip_image_tool, callback_url, regen_conv_url, regen_prompt, batch_key } = params;
   try {
+    // Notify backend that job is processing
+    await sendCallback(callback_url, {
+      type: "starting",
+      job_id: parseInt(job_id),
+      batch_key,
+    }).catch(() => {});
+
     const outputFile = await spawnRegenWorker({
       cookieDir: cookiePath,
       imagePath,
