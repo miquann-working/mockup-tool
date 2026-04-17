@@ -201,4 +201,51 @@ try {
   // column already exists – ignore
 }
 
+// ── Migration: make prompt_id nullable in jobs (allow prompt deletion) ─────
+try {
+  const jobsSql = db.prepare(
+    `SELECT sql FROM sqlite_master WHERE type='table' AND name='jobs'`
+  ).get();
+  if (jobsSql && jobsSql.sql && jobsSql.sql.includes('prompt_id INTEGER NOT NULL')) {
+    db.pragma('foreign_keys = OFF');
+    const migrateJobs = db.transaction(() => {
+      db.exec(`DROP TABLE IF EXISTS jobs_new`);
+      db.exec(`
+        CREATE TABLE jobs_new (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          batch_id TEXT,
+          user_id INTEGER NOT NULL REFERENCES users(id),
+          prompt_id INTEGER REFERENCES prompts(id),
+          account_id INTEGER REFERENCES gemini_accounts(id),
+          original_image TEXT NOT NULL,
+          mockup_image TEXT,
+          line_image TEXT,
+          status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','processing','mockup_done','done','error')),
+          error TEXT,
+          created_at TEXT DEFAULT (datetime('now')),
+          updated_at TEXT DEFAULT (datetime('now')),
+          retry_count INTEGER NOT NULL DEFAULT 0,
+          conversation_url TEXT,
+          previous_images TEXT
+        )
+      `);
+      db.exec(`
+        INSERT INTO jobs_new (id, batch_id, user_id, prompt_id, account_id, original_image,
+          mockup_image, line_image, status, error, created_at, updated_at,
+          retry_count, conversation_url, previous_images)
+        SELECT id, batch_id, user_id, prompt_id, account_id, original_image,
+          mockup_image, line_image, status, error, created_at, updated_at,
+          retry_count, conversation_url, previous_images
+        FROM jobs
+      `);
+      db.exec(`DROP TABLE jobs`);
+      db.exec(`ALTER TABLE jobs_new RENAME TO jobs`);
+    });
+    migrateJobs();
+    db.pragma('foreign_keys = ON');
+  }
+} catch (e) {
+  // ignore if already migrated
+}
+
 module.exports = db;

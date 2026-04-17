@@ -112,7 +112,9 @@ router.put("/:id", authMiddleware, adminOnly, (req, res) => {
  *         description: Xóa thành công
  */
 router.delete("/:id", authMiddleware, adminOnly, (req, res) => {
-  db.prepare("DELETE FROM prompts WHERE id = ?").run(Number(req.params.id));
+  const promptId = Number(req.params.id);
+  db.prepare("UPDATE jobs SET prompt_id = NULL WHERE prompt_id = ?").run(promptId);
+  db.prepare("DELETE FROM prompts WHERE id = ?").run(promptId);
   res.json({ ok: true });
 });
 

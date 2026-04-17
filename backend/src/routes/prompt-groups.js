@@ -222,6 +222,7 @@ router.put("/:id", authMiddleware, (req, res) => {
     // Delete prompts that were removed by user (not in keptIds)
     for (const oldId of existingIds) {
       if (!keptIds.has(oldId)) {
+        db.prepare("UPDATE jobs SET prompt_id = NULL WHERE prompt_id = ?").run(oldId);
         db.prepare("DELETE FROM prompts WHERE id = ? AND group_id = ?").run(oldId, groupId);
       }
     }
@@ -252,15 +253,15 @@ router.delete("/:id", authMiddleware, (req, res) => {
     return res.status(403).json({ error: "Không có quyền xóa chủ đề này" });
   }
 
-  db.pragma("foreign_keys = OFF");
-  try {
-    db.transaction(() => {
-      db.prepare("DELETE FROM prompts WHERE group_id = ?").run(groupId);
-      db.prepare("DELETE FROM prompt_groups WHERE id = ?").run(groupId);
-    })();
-  } finally {
-    db.pragma("foreign_keys = ON");
-  }
+  db.transaction(() => {
+    // Nullify prompt references in jobs before deleting prompts
+    const promptIds = db.prepare("SELECT id FROM prompts WHERE group_id = ?").all(groupId);
+    for (const { id } of promptIds) {
+      db.prepare("UPDATE jobs SET prompt_id = NULL WHERE prompt_id = ?").run(id);
+    }
+    db.prepare("DELETE FROM prompts WHERE group_id = ?").run(groupId);
+    db.prepare("DELETE FROM prompt_groups WHERE id = ?").run(groupId);
+  })();
   res.json({ ok: true });
 });
 
