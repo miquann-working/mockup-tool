@@ -75,13 +75,21 @@ function scheduleCooldown(accountId) {
   }, COOLDOWN_MS);
 }
 
-function markAccountRateLimited(accountId) {
-  // Mark account as rate-limited for 24 hours
-  db.prepare(
-    "UPDATE gemini_accounts SET rate_limited_until = datetime('now', '+24 hours'), status = 'free', last_used_at = datetime('now') WHERE id = ?"
-  ).run(accountId);
+function markAccountRateLimited(accountId, resetTime) {
+  // Use exact reset time from Gemini if available, otherwise default to 24 hours
   const account = db.prepare("SELECT email FROM gemini_accounts WHERE id = ?").get(accountId);
-  console.log(`[RateLimit] Account #${accountId} (${account?.email}) rate-limited until +24h`);
+  if (resetTime) {
+    // resetTime is ISO string like "2026-04-17T14:45:00"
+    db.prepare(
+      "UPDATE gemini_accounts SET rate_limited_until = ?, status = 'free', last_used_at = datetime('now') WHERE id = ?"
+    ).run(resetTime.replace("T", " "), accountId);
+    console.log(`[RateLimit] Account #${accountId} (${account?.email}) rate-limited until ${resetTime}`);
+  } else {
+    db.prepare(
+      "UPDATE gemini_accounts SET rate_limited_until = datetime('now', '+24 hours'), status = 'free', last_used_at = datetime('now') WHERE id = ?"
+    ).run(accountId);
+    console.log(`[RateLimit] Account #${accountId} (${account?.email}) rate-limited until +24h (no reset time from Gemini)`);
+  }
 }
 
 function updateJob(jobId, fields) {
@@ -135,6 +143,11 @@ function runAutomation({ cookieDir, imagePath, promptText, outputPrefix, imageSt
       if (code === 2) {
         const err = new Error("RATE_LIMITED");
         err.rateLimited = true;
+        // Parse reset time from stdout: "RATE_LIMITED:2026-04-17T14:45:00"
+        const rlLine = stdout.split("\n").find(l => l.startsWith("RATE_LIMITED:"));
+        if (rlLine && rlLine.length > 13) {
+          err.resetTime = rlLine.substring(13).trim();
+        }
         return reject(err);
       }
       if (code !== 0) {
@@ -200,6 +213,11 @@ function runBatchAutomation({ cookieDir, imagePath, imageStyle, skipImageTool, j
         // Exit code 2 = rate limited
         const err = new Error("RATE_LIMITED");
         err.rateLimited = true;
+        // Parse reset time from buffered stdout
+        const rlLine = (stdoutBuf || "").split("\n").find(l => l.startsWith("RATE_LIMITED:"));
+        if (rlLine && rlLine.length > 13) {
+          err.resetTime = rlLine.substring(13).trim();
+        }
         return reject(err);
       }
       if (code !== 0) {
@@ -733,8 +751,8 @@ async function processBatchJobs(jobIds, accountId, batchKey) {
         `${completedSet.size}/${allIds.length} done, ${failedIds.length} returning to pending.`
       );
 
-      // Mark account as rate-limited (24h cooldown)
-      markAccountRateLimited(accountId);
+      // Mark account as rate-limited (use exact time if available)
+      markAccountRateLimited(accountId, err.resetTime);
 
       // Return incomplete jobs to pending WITHOUT incrementing retry_count
       for (const id of failedIds) {
@@ -972,7 +990,7 @@ async function processJob(jobId, accountId, batchKeyOverride) {
     // ── Rate limit: mark account, return job to pending
     if (err.rateLimited || err.message === "RATE_LIMITED") {
       console.warn(`[Job ${jobId}] RATE LIMITED on account #${accountId}`);
-      markAccountRateLimited(accountId);
+      markAccountRateLimited(accountId, err.resetTime);
       updateJob(jobId, { status: "pending", error: null, account_id: null });
 
       const batchKey = getBatchKey(jobId);
@@ -1078,12 +1096,11 @@ function handleVpsCallback(data) {
       break;
 
     case "rate_limited":
-      console.warn(`[VPS] Job ${job_id} RATE LIMITED`);
+      console.warn(`[VPS] Job ${job_id} RATE LIMITED${data.reset_time ? ` (resets at ${data.reset_time})` : ""}`);
       if (batch_key && batch_key.startsWith("single_")) {
-        handleVpsSingleRateLimit(job_id, batch_key);
+        handleVpsSingleRateLimit(job_id, batch_key, data.reset_time);
       } else if (batch_key && batch_key.startsWith("regen_")) {
-        updateJob(job_id, { status: "error", error: "Rate limited during regen" });
-        releaseBatchAfterVps(batch_key);
+        handleVpsRegenRateLimit(job_id, batch_key, data.reset_time);
       }
       // For batch: batch_complete follows (with error = RATE_LIMITED)
       break;
@@ -1128,10 +1145,10 @@ function handleVpsSingleError(jobId, batchKey, errMsg) {
   }
 }
 
-function handleVpsSingleRateLimit(jobId, batchKey) {
+function handleVpsSingleRateLimit(jobId, batchKey, resetTime) {
   const batch = batches.get(batchKey);
   if (batch && batch.accountId) {
-    markAccountRateLimited(batch.accountId);
+    markAccountRateLimited(batch.accountId, resetTime);
     batch.accountId = null;
   }
 
@@ -1142,6 +1159,31 @@ function handleVpsSingleRateLimit(jobId, batchKey) {
     if (!batch.jobs.includes(jobId)) batch.jobs.unshift(jobId);
   }
 
+  scheduleWaiting();
+  if (batch) {
+    setTimeout(() => {
+      if (!batch.processing) startBatch(batchKey);
+    }, 500);
+  }
+}
+
+function handleVpsRegenRateLimit(jobId, batchKey, resetTime) {
+  const batch = batches.get(batchKey);
+  if (batch && batch.accountId) {
+    markAccountRateLimited(batch.accountId, resetTime);
+    batch.accountId = null;
+  }
+
+  // Return regen job to pending so it can be retried with another account
+  updateJob(jobId, { status: "pending", error: null, account_id: null });
+  console.log(`[VPS] Regen job ${jobId} returned to pending after rate limit`);
+
+  if (batch) {
+    batch.processing = false;
+    if (!batch.jobs.includes(jobId)) batch.jobs.unshift(jobId);
+  }
+
+  // Try to find another available account
   scheduleWaiting();
   if (batch) {
     setTimeout(() => {
@@ -1196,7 +1238,7 @@ function handleVpsBatchComplete(data) {
   // Rate limited — mark account, return jobs to pending, try another account
   const isRateLimit = error === "RATE_LIMITED";
   if (isRateLimit) {
-    if (accountId) markAccountRateLimited(accountId);
+    if (accountId) markAccountRateLimited(accountId, data.reset_time);
     batch.accountId = null;
 
     for (const j of failedJobs) {

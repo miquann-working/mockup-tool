@@ -487,6 +487,7 @@ async function executeSingleJob(params) {
       job_id: parseInt(job_id),
       batch_key,
       error: err.message,
+      reset_time: err.resetTime || null,
     }).catch(e => log(`[Job ${job_id}] Callback failed: ${e.message}`));
   } finally {
     activeWorkers--;
@@ -576,6 +577,7 @@ async function executeRegenJob(params) {
       job_id: parseInt(job_id),
       batch_key,
       error: err.message,
+      reset_time: err.resetTime || null,
     }).catch(e => log(`[Regen ${job_id}] Callback failed: ${e.message}`));
   } finally {
     activeWorkers--;
@@ -738,6 +740,7 @@ async function executeBatchJob(params) {
           job_id: jobIdList[i],
           batch_key,
           error: err.message,
+          reset_time: err.resetTime || null,
         }).catch(() => {});
       }
     }
@@ -748,6 +751,7 @@ async function executeBatchJob(params) {
       completed: [...completedSet].map(i => jobIdList[i]),
       total: jobIdList.length,
       error: err.message,
+      reset_time: err.resetTime || null,
     }).catch(() => {});
 
   } finally {
@@ -801,6 +805,10 @@ function spawnWorker({ cookieDir, imagePath, promptText, outputPrefix, imageStyl
       if (code === 2) {
         const err = new Error("RATE_LIMITED");
         err.rateLimited = true;
+        const rlLine = stdout.split("\n").find(l => l.startsWith("RATE_LIMITED:"));
+        if (rlLine && rlLine.length > 13) {
+          err.resetTime = rlLine.substring(13).trim();
+        }
         return reject(err);
       }
       if (code !== 0) {
@@ -867,12 +875,17 @@ function spawnRegenWorker({ cookieDir, imagePath, outputPrefix, imageStyle, skip
       if (code === 2) {
         const err = new Error("RATE_LIMITED");
         err.rateLimited = true;
+        // Parse reset time from stdout: "RATE_LIMITED:2026-04-17T14:45:00"
+        const rlLine = stdout.split("\n").find(l => l.startsWith("RATE_LIMITED:"));
+        if (rlLine && rlLine.length > 13) {
+          err.resetTime = rlLine.substring(13).trim();
+        }
         return reject(err);
       }
       if (code !== 0) {
         return reject(new Error(`Regen worker exited ${code}: ${stderr.slice(-500)}`));
       }
-      const output = stdout.trim().split("\n").filter(l => !l.startsWith("CONV_URL:")).pop();
+      const output = stdout.trim().split("\n").filter(l => !l.startsWith("CONV_URL:") && !l.startsWith("RATE_LIMITED")).pop();
       if (!output) {
         return reject(new Error("Regen worker returned empty output"));
       }
@@ -941,6 +954,11 @@ function spawnBatchWorker({ cookieDir, imagePath, imageStyle, skipImageTool, job
       if (code === 2) {
         const err = new Error("RATE_LIMITED");
         err.rateLimited = true;
+        // Parse reset time from buffered stdout
+        const rlLine = (stdoutBuf || "").split("\n").find(l => l.startsWith("RATE_LIMITED:"));
+        if (rlLine && rlLine.length > 13) {
+          err.resetTime = rlLine.substring(13).trim();
+        }
         return reject(err);
       }
       if (code !== 0) {

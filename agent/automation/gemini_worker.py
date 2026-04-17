@@ -46,7 +46,9 @@ MAX_WAIT_SECS = 600  # 10 min max wait for image generation
 
 class RateLimitError(Exception):
     """Raised when Gemini rate-limits image generation for this account."""
-    pass
+    def __init__(self, message="Account rate limited by Gemini", reset_time=None):
+        super().__init__(message)
+        self.reset_time = reset_time  # ISO string or None
 
 
 def log(msg):
@@ -456,9 +458,13 @@ def main():
             log(f"SUCCESS: {output_filename}")
             print(output_filename)
 
-        except RateLimitError:
+        except RateLimitError as rle:
             log("RATE_LIMITED: Account hit Gemini image generation limit")
-            print("RATE_LIMITED", flush=True)
+            if rle.reset_time:
+                log(f"  Rate limit resets at: {rle.reset_time}")
+                print(f"RATE_LIMITED:{rle.reset_time}", flush=True)
+            else:
+                print("RATE_LIMITED", flush=True)
             browser.close()
             sys.exit(2)
 
@@ -697,9 +703,13 @@ def main_regen():
             log(f"SUCCESS: {output_filename}")
             print(output_filename)
 
-        except RateLimitError:
+        except RateLimitError as rle:
             log("RATE_LIMITED: Account hit Gemini image generation limit")
-            print("RATE_LIMITED", flush=True)
+            if rle.reset_time:
+                log(f"  Rate limit resets at: {rle.reset_time}")
+                print(f"RATE_LIMITED:{rle.reset_time}", flush=True)
+            else:
+                print("RATE_LIMITED", flush=True)
             browser.close()
             sys.exit(2)
 
@@ -898,9 +908,13 @@ def main_batch():
                 print(f"CONV_URL:{conv_url}", flush=True)
                 log(f"Conversation URL: {conv_url}")
 
-        except RateLimitError:
+        except RateLimitError as rle:
             log("RATE_LIMITED: Account hit Gemini image generation limit")
-            print("RATE_LIMITED", flush=True)
+            if rle.reset_time:
+                log(f"  Rate limit resets at: {rle.reset_time}")
+                print(f"RATE_LIMITED:{rle.reset_time}", flush=True)
+            else:
+                print("RATE_LIMITED", flush=True)
             browser.close()
             sys.exit(2)
 
@@ -2168,35 +2182,93 @@ def _submit_prompt(page):
 
 
 def _check_rate_limit(page, resp_before):
-    """Check if the latest response contains a rate limit message. Raises RateLimitError if so."""
-    is_limited = page.evaluate('''(respBefore) => {
+    """Check if the latest response or any banner contains a rate limit message.
+    Parses the reset time from Gemini's message if available.
+    Raises RateLimitError with reset_time if detected.
+    """
+    rate_info = page.evaluate('''(respBefore) => {
         const S = window.__SEL || {};
         const rlTerms = S.rate_limit_terms || [
             "can't generate more images", "cannot generate more images",
             "đạt đến giới hạn", "giới hạn tạo hình ảnh",
             "come back tomorrow", "vui lòng đợi đến"
         ];
+
+        // Collect all text from potential rate limit sources
+        let allTexts = [];
+
         const respSel = S.response_element || 'response-element';
         const allResponses = document.querySelectorAll(respSel);
         for (let i = respBefore; i < allResponses.length; i++) {
             const text = (allResponses[i].innerText || "").toLowerCase();
-            if (rlTerms.some(t => text.includes(t))) {
-                return true;
-            }
+            allTexts.push(text);
         }
-        // Also check for the banner/info bar with rate limit message
+
+        // Also check banners/info bars (rate limit banner may appear outside response)
         const banners = document.querySelectorAll('[class*="banner"], [class*="info"], [role="status"], [role="alert"]');
         for (const el of banners) {
             const text = (el.innerText || "").toLowerCase();
-            if (rlTerms.some(t => text.includes(t))) {
-                return true;
-            }
+            allTexts.push(text);
         }
-        return false;
+
+        // Check all collected text for rate limit terms
+        const fullText = allTexts.join(" ");
+        const found = rlTerms.some(t => fullText.includes(t));
+        if (!found) return null;
+
+        // Try to extract reset time: "vui lòng đợi đến HH:MM DD thg M"
+        // or "please wait until HH:MM"
+        return fullText;
     }''', resp_before)
-    if is_limited:
+
+    if rate_info is not None:
         log("  ⚠ RATE LIMIT DETECTED — account has reached image generation limit")
-        raise RateLimitError("Account rate limited by Gemini")
+        reset_time = _parse_rate_limit_time(rate_info)
+        if reset_time:
+            log(f"  ⚠ Rate limit resets at: {reset_time}")
+        raise RateLimitError("Account rate limited by Gemini", reset_time=reset_time)
+
+
+def _parse_rate_limit_time(text):
+    """Parse the reset time from Gemini's rate limit message.
+    Supports Vietnamese format: 'vui lòng đợi đến 14:45 17 thg 4 để tiếp tục'
+    Returns ISO datetime string or None.
+    """
+    import re
+    from datetime import datetime, timedelta
+
+    # Vietnamese format: "HH:MM DD thg M"
+    match = re.search(r'đợi đến\s+(\d{1,2}):(\d{2})\s+(\d{1,2})\s+thg\s+(\d{1,2})', text)
+    if match:
+        hour, minute, day, month = int(match.group(1)), int(match.group(2)), int(match.group(3)), int(match.group(4))
+        now = datetime.now()
+        year = now.year
+        try:
+            target = datetime(year, month, day, hour, minute)
+            # If target is in the past, it might be next year
+            if target < now - timedelta(hours=1):
+                target = datetime(year + 1, month, day, hour, minute)
+            return target.strftime("%Y-%m-%dT%H:%M:00")
+        except ValueError:
+            pass
+
+    # English format: "wait until HH:MM" or "come back at HH:MM"
+    match = re.search(r'(?:until|at)\s+(\d{1,2}):(\d{2})', text)
+    if match:
+        hour, minute = int(match.group(1)), int(match.group(2))
+        now = datetime.now()
+        target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if target < now:
+            target += timedelta(days=1)
+        return target.strftime("%Y-%m-%dT%H:%M:00")
+
+    # "come back tomorrow" — default to ~24h
+    if "tomorrow" in text or "ngày mai" in text:
+        now = datetime.now()
+        target = now + timedelta(hours=24)
+        return target.strftime("%Y-%m-%dT%H:%M:00")
+
+    return None
 
 
 def _wait_for_response(page, resp_before=0):
@@ -2275,8 +2347,22 @@ def _wait_for_response(page, resp_before=0):
                 thinking_start = elapsed
             # Extend Phase 1 deadline since Gemini IS processing, but cap at MAX_WAIT_SECS
             MAX_START_WAIT = min(max(MAX_START_WAIT, elapsed + 120), MAX_WAIT_SECS)
+
+            # Check for rate limit while "thinking" — Gemini may have responded
+            # with rate limit text but still showing a stop/thinking indicator
+            if elapsed - thinking_start > 15 and elapsed % 10 < 1:
+                try:
+                    _check_rate_limit(page, resp_before)
+                except RateLimitError:
+                    raise  # re-raise — will be caught by outer handler
+
             # If thinking for too long without response element, likely stuck
             if elapsed - thinking_start > 300:
+                # Last chance: check rate limit before giving up
+                try:
+                    _check_rate_limit(page, resp_before)
+                except RateLimitError:
+                    raise
                 log(f"  Thinking for {elapsed - thinking_start}s without response — likely stuck")
                 debug_path = os.path.join(OUTPUT_DIR, f"debug_stuck_{OUTPUT_PREFIX}.png")
                 try:
@@ -2292,6 +2378,11 @@ def _wait_for_response(page, resp_before=0):
         time.sleep(0.5)
     else:
         raise Exception(f"No response element after {MAX_START_WAIT}s — prompt was likely not submitted")
+
+    # Quick rate limit check before spending time in Phase 2
+    # Gemini may have responded instantly with a rate limit text message
+    time.sleep(0.5)  # brief settle
+    _check_rate_limit(page, resp_before)
 
     # ── Phase 2: Wait for IMAGE to appear in the response ──
     log("  Phase 2: Waiting for image generation to complete...")
