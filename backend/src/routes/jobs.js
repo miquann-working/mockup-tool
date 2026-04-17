@@ -293,28 +293,28 @@ router.post("/:id/retry", authMiddleware, (req, res) => {
     return res.status(400).json({ error: "Can only retry failed jobs" });
   }
 
-  // If this job belongs to a batch, retry ALL error jobs in the batch together
+  // If this job belongs to a batch, retry ALL jobs in the batch (replay entire conversation)
   if (job.batch_id) {
-    const batchErrorJobs = db
-      .prepare("SELECT id, mockup_image, previous_images, updated_at FROM jobs WHERE batch_id = ? AND status = 'error' ORDER BY id ASC")
+    const batchJobs = db
+      .prepare("SELECT id, status, mockup_image, previous_images, updated_at FROM jobs WHERE batch_id = ? ORDER BY id ASC")
       .all(job.batch_id);
-    for (const ej of batchErrorJobs) {
+    for (const bj of batchJobs) {
       // Save existing image to previous_images before retrying (rename to preserve)
-      if (ej.mockup_image) {
-        const prev = ej.previous_images ? JSON.parse(ej.previous_images) : [];
-        const preserved = preserveOutputFile(ej.mockup_image);
-        prev.push({ image: preserved, at: ej.updated_at || new Date().toISOString() });
-        db.prepare("UPDATE jobs SET previous_images = ?, mockup_image = NULL WHERE id = ?").run(JSON.stringify(prev), ej.id);
+      if (bj.mockup_image) {
+        const prev = bj.previous_images ? JSON.parse(bj.previous_images) : [];
+        const preserved = preserveOutputFile(bj.mockup_image);
+        prev.push({ image: preserved, at: bj.updated_at || new Date().toISOString() });
+        db.prepare("UPDATE jobs SET previous_images = ?, mockup_image = NULL WHERE id = ?").run(JSON.stringify(prev), bj.id);
       }
       db.prepare(
         "UPDATE jobs SET status = 'pending', error = NULL, retry_count = 0, updated_at = datetime('now') WHERE id = ?"
-      ).run(ej.id);
+      ).run(bj.id);
     }
     // Enqueue all batch jobs so they run together in one conversation
-    for (const ej of batchErrorJobs) {
-      enqueueJob(ej.id);
+    for (const bj of batchJobs) {
+      enqueueJob(bj.id);
     }
-    console.log(`[Retry] Batch ${job.batch_id}: retrying ${batchErrorJobs.length} error jobs together`);
+    console.log(`[Retry] Batch ${job.batch_id}: retrying ALL ${batchJobs.length} jobs (${batchJobs.filter(j => j.status === 'done').length} were done, ${batchJobs.filter(j => j.status === 'error').length} were error)`);
   } else {
     // Save existing image to previous_images before retrying (rename to preserve)
     if (job.mockup_image) {
