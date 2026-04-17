@@ -21,6 +21,10 @@ const VPS_CALLBACK_URL = `${CALLBACK_BASE_URL}/api/vps/job-callback`;
 // Map<batchKey, number>
 const pendingRetries = new Map();
 
+// Regen params stored temporarily until processJob picks them up
+// Map<jobId, { fullRegenPrompt, freshPrompt, outputPrefix, imageStyle, isLineDrawing, isTrade, conversationUrl }>
+const regenParams = new Map();
+
 // ── Helpers ─────────────────────────────────────────────────
 
 function pickAccount(userId) {
@@ -435,13 +439,30 @@ function startBatch(batchKey) {
     batch.accountId = account.id;
     setAccountStatus(account.id, "busy");
     console.log(`[Batch ${batchKey}] Assigned account ${account.email} (#${account.id})`);
+  } else {
+    // Pre-assigned account (e.g. regen) — check if it's available
+    const preAccount = db.prepare("SELECT status FROM gemini_accounts WHERE id = ?").get(batch.accountId);
+    if (!preAccount || preAccount.status === "busy" || preAccount.status === "cooldown" || preAccount.status === "rate_limited" || preAccount.status === "disabled") {
+      if (!waitingBatches.includes(batchKey)) {
+        waitingBatches.push(batchKey);
+        waitingBatches.sort((a, b) => {
+          const batchA = batches.get(a);
+          const batchB = batches.get(b);
+          return (batchA?.minJobId || Infinity) - (batchB?.minJobId || Infinity);
+        });
+        console.log(`[Batch ${batchKey}] Pre-assigned account #${batch.accountId} not free, queued (${waitingBatches.length} waiting)`);
+      }
+      return;
+    }
+    setAccountStatus(batch.accountId, "busy");
+    console.log(`[Batch ${batchKey}] Pre-assigned account #${batch.accountId} now busy`);
   }
 
   // Process jobs
   batch.processing = true;
 
   // Multi-job batch: process ALL jobs in one Gemini conversation
-  if (!batchKey.startsWith("single_")) {
+  if (!batchKey.startsWith("single_") && !batchKey.startsWith("regen_")) {
     const allJobIds = [...batch.jobs];
     batch.jobs = [];
     processBatchJobs(allJobIds, batch.accountId, batchKey)
@@ -460,7 +481,7 @@ function startBatch(batchKey) {
 
   // Single job: existing one-by-one behavior
   const jobId = batch.jobs.shift();
-  processJob(jobId, batch.accountId)
+  processJob(jobId, batch.accountId, batchKey)
     .then((result) => {
       if (result === "vps_dispatched") return; // VPS callback handles completion
       batch.processing = false;
@@ -802,7 +823,7 @@ async function processBatchJobs(jobIds, accountId, batchKey) {
 /**
  * Process a single job with a specific account.
  */
-async function processJob(jobId, accountId) {
+async function processJob(jobId, accountId, batchKeyOverride) {
   const job = db.prepare("SELECT * FROM jobs WHERE id = ?").get(jobId);
   if (!job || job.status === "done") return;
 
@@ -813,6 +834,59 @@ async function processJob(jobId, accountId) {
   }
 
   updateJob(jobId, { status: "processing", account_id: accountId });
+
+  // ── Regen dispatch (queued) ───────────────────────────────
+  if (regenParams.has(jobId)) {
+    const regen = regenParams.get(jobId);
+    regenParams.delete(jobId);
+
+    if (!account.vps_id) {
+      updateJob(jobId, { status: "error", error: "Regeneration requires VPS dispatch" });
+      return;
+    }
+    const vpsNode = getVpsNode(account.vps_id);
+    if (!vpsNode || vpsNode.status !== "online") {
+      updateJob(jobId, { status: "error", error: `VPS #${account.vps_id} is offline or not found` });
+      return;
+    }
+    const batchKey = batchKeyOverride || `regen_${jobId}`;
+    try {
+      const syncOk = await syncCookiesToVps(vpsNode, account.cookie_dir);
+      if (!syncOk) throw new Error(`Cookie sync failed for ${path.basename(account.cookie_dir)}`);
+
+      if (regen.conversationUrl) {
+        await dispatchRegenToVps(vpsNode, {
+          jobId,
+          cookieDir: account.cookie_dir,
+          imagePath: path.resolve(__dirname, "../../../uploads", job.original_image),
+          outputPrefix: regen.outputPrefix,
+          imageStyle: regen.imageStyle,
+          skipImageTool: regen.isLineDrawing || regen.isTrade,
+          regenConvUrl: regen.conversationUrl,
+          regenPrompt: regen.fullRegenPrompt,
+          batchKey,
+        });
+        console.log(`[Regen] Job ${jobId} dispatched to VPS ${vpsNode.name} (conversation regen)`);
+      } else {
+        await dispatchSingleToVps(vpsNode, {
+          jobId,
+          cookieDir: account.cookie_dir,
+          imagePath: path.resolve(__dirname, "../../../uploads", job.original_image),
+          promptText: regen.freshPrompt,
+          outputPrefix: regen.outputPrefix,
+          imageStyle: regen.imageStyle,
+          skipImageTool: regen.isLineDrawing,
+          batchKey,
+        });
+        console.log(`[Regen] Job ${jobId} dispatched to VPS ${vpsNode.name} (fresh conversation)`);
+      }
+      return "vps_dispatched";
+    } catch (dispatchErr) {
+      console.error(`[Regen] Job ${jobId} dispatch failed: ${dispatchErr.message}`);
+      updateJob(jobId, { status: "error", error: `Regen dispatch failed: ${dispatchErr.message}` });
+      return;
+    }
+  }
 
   const prompt = db.prepare("SELECT * FROM prompts WHERE id = ?").get(job.prompt_id);
   if (!prompt) {
@@ -834,7 +908,7 @@ async function processJob(jobId, accountId) {
       return;
     }
 
-    const batchKey = getBatchKey(jobId);
+    const batchKey = batchKeyOverride || getBatchKey(jobId);
     try {
       const syncOk = await syncCookiesToVps(vpsNode, account.cookie_dir);
       if (!syncOk) {
@@ -1257,11 +1331,6 @@ async function regenerateJob(jobId, regenPrompt) {
   const account = db.prepare("SELECT * FROM gemini_accounts WHERE id = ?").get(job.account_id);
   if (!account) throw new Error("Original account not found");
 
-  // Check if account is currently busy — if so, cannot dispatch regen now
-  if (account.status === "busy" || account.status === "cooldown") {
-    throw new Error("Tài khoản Gemini đang bận, vui lòng chờ job hiện tại xong rồi thử lại");
-  }
-
   // Save current mockup_image to previous_images before regenerating
   if (job.mockup_image) {
     const prev = job.previous_images ? JSON.parse(job.previous_images) : [];
@@ -1284,71 +1353,34 @@ async function regenerateJob(jobId, regenPrompt) {
   const fullRegenPrompt = prompt
     ? `Hãy tạo lại ảnh cho góc "${prompt.name}" với yêu cầu bổ sung sau: ${regenPrompt}`
     : regenPrompt;
+  const freshPrompt = prompt
+    ? `${prompt.content}\n\nYêu cầu bổ sung: ${regenPrompt}`
+    : regenPrompt;
 
-  if (account.vps_id) {
-    // VPS dispatch
-    const vpsNode = getVpsNode(account.vps_id);
-    if (!vpsNode || vpsNode.status !== "online") {
-      updateJob(jobId, { status: "error", error: "VPS offline" });
-      throw new Error("VPS is offline");
-    }
+  // Store regen params for processJob to use when this job is dequeued
+  regenParams.set(jobId, {
+    fullRegenPrompt,
+    freshPrompt,
+    outputPrefix,
+    imageStyle,
+    isLineDrawing,
+    isTrade,
+    conversationUrl: job.conversation_url,
+  });
 
-    // Lock account during regen
-    setAccountStatus(account.id, "busy");
-    const batchKey = `regen_${jobId}_${ts}`;
-    batches.set(batchKey, { accountId: account.id, jobs: [], processing: true, minJobId: jobId });
+  // Enqueue through the queue system — use timestamp as minJobId so regen
+  // sorts after all normal batches (FIFO: earlier requests processed first)
+  const regenBatchKey = `regen_${jobId}_${ts}`;
+  batches.set(regenBatchKey, {
+    accountId: account.id, // Pre-assign original account (conversation is tied to it)
+    jobs: [jobId],
+    processing: false,
+    minJobId: ts, // Timestamp >> job IDs → regen always queues after normal batches
+  });
 
-    try {
-      const syncOk = await syncCookiesToVps(vpsNode, account.cookie_dir);
-      if (!syncOk) {
-        throw new Error(`Cookie sync failed for ${path.basename(account.cookie_dir)}`);
-      }
-
-      if (job.conversation_url) {
-        // Has conversation URL → use regen endpoint (continue existing conversation)
-        await dispatchRegenToVps(vpsNode, {
-          jobId,
-          cookieDir: account.cookie_dir,
-          imagePath: path.resolve(__dirname, "../../../uploads", job.original_image),
-          outputPrefix,
-          imageStyle,
-          skipImageTool: isLineDrawing || isTrade,
-          regenConvUrl: job.conversation_url,
-          regenPrompt: fullRegenPrompt,
-          batchKey,
-        });
-        console.log(`[Regen] Job ${jobId} dispatched to VPS ${vpsNode.name} (conversation regen)`);
-      } else {
-        // No conversation URL → dispatch as fresh single job with modified prompt
-        // Use skipImageTool: isLineDrawing only (same as processJob) — trade needs the image tool
-        const freshPrompt = prompt
-          ? `${prompt.content}\n\nYêu cầu bổ sung: ${regenPrompt}`
-          : regenPrompt;
-        await dispatchSingleToVps(vpsNode, {
-          jobId,
-          cookieDir: account.cookie_dir,
-          imagePath: path.resolve(__dirname, "../../../uploads", job.original_image),
-          promptText: freshPrompt,
-          outputPrefix,
-          imageStyle,
-          skipImageTool: isLineDrawing,
-          batchKey,
-        });
-        console.log(`[Regen] Job ${jobId} dispatched to VPS ${vpsNode.name} (fresh conversation)`);
-      }
-
-      return { dispatched: true };
-    } catch (err) {
-      updateJob(jobId, { status: "error", error: `Regen dispatch failed: ${err.message}` });
-      // Release account on dispatch failure
-      releaseBatchAfterVps(batchKey);
-      throw err;
-    }
-  } else {
-    // Local execution (no VPS)
-    updateJob(jobId, { status: "error", error: "Local regen not supported — VPS required" });
-    throw new Error("Regeneration requires VPS dispatch");
-  }
+  console.log(`[Regen] Job ${jobId} enqueued as batch ${regenBatchKey}`);
+  startBatch(regenBatchKey);
+  return { queued: true };
 }
 
 module.exports = { enqueueJob, handleVpsCallback, regenerateJob };
