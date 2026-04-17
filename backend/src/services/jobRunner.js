@@ -316,7 +316,7 @@ async function dispatchBatchToVps(vpsNode, params) {
 async function dispatchRegenToVps(vpsNode, params) {
   const {
     jobId, cookieDir, imagePath, outputPrefix, imageStyle,
-    skipImageTool, regenConvUrl, regenPrompt,
+    skipImageTool, regenConvUrl, regenPrompt, batchKey,
   } = params;
 
   const url = `${getAgentBaseUrl(vpsNode)}/agent/execute-regen`;
@@ -331,6 +331,7 @@ async function dispatchRegenToVps(vpsNode, params) {
   formData.append("callback_url", VPS_CALLBACK_URL);
   formData.append("regen_conv_url", regenConvUrl);
   formData.append("regen_prompt", regenPrompt);
+  formData.append("batch_key", batchKey || "");
 
   const res = await fetch(url, {
     method: "POST",
@@ -977,8 +978,8 @@ function handleVpsCallback(data) {
       updateJob(job_id, doneUpdate);
       console.log(`[VPS] Job ${job_id} DONE: ${output_file}`);
 
-      // For single jobs, release batch now (no batch_complete callback)
-      if (batch_key && batch_key.startsWith("single_")) {
+      // For single jobs and regen jobs, release batch now (no batch_complete callback)
+      if (batch_key && (batch_key.startsWith("single_") || batch_key.startsWith("regen_"))) {
         releaseBatchAfterVps(batch_key);
       }
       break;
@@ -994,6 +995,10 @@ function handleVpsCallback(data) {
       // For single jobs, handle retry
       if (batch_key && batch_key.startsWith("single_")) {
         handleVpsSingleError(job_id, batch_key, error);
+      } else if (batch_key && batch_key.startsWith("regen_")) {
+        // Regen errors: mark as error directly (regen prompt not stored for retry)
+        updateJob(job_id, { status: "error", error });
+        releaseBatchAfterVps(batch_key);
       }
       // For batch jobs, batch_complete handles
       break;
@@ -1002,6 +1007,9 @@ function handleVpsCallback(data) {
       console.warn(`[VPS] Job ${job_id} RATE LIMITED`);
       if (batch_key && batch_key.startsWith("single_")) {
         handleVpsSingleRateLimit(job_id, batch_key);
+      } else if (batch_key && batch_key.startsWith("regen_")) {
+        updateJob(job_id, { status: "error", error: "Rate limited during regen" });
+        releaseBatchAfterVps(batch_key);
       }
       // For batch: batch_complete follows (with error = RATE_LIMITED)
       break;
@@ -1280,6 +1288,11 @@ async function regenerateJob(jobId, regenPrompt) {
       throw new Error("VPS is offline");
     }
 
+    // Lock account during regen
+    setAccountStatus(account.id, "busy");
+    const batchKey = `regen_${jobId}_${ts}`;
+    batches.set(batchKey, { accountId: account.id, jobs: [], processing: true, minJobId: jobId });
+
     try {
       const syncOk = await syncCookiesToVps(vpsNode, account.cookie_dir);
       if (!syncOk) {
@@ -1297,6 +1310,7 @@ async function regenerateJob(jobId, regenPrompt) {
           skipImageTool: isLineDrawing || isTrade,
           regenConvUrl: job.conversation_url,
           regenPrompt: fullRegenPrompt,
+          batchKey,
         });
         console.log(`[Regen] Job ${jobId} dispatched to VPS ${vpsNode.name} (conversation regen)`);
       } else {
@@ -1304,7 +1318,6 @@ async function regenerateJob(jobId, regenPrompt) {
         const freshPrompt = prompt
           ? `${prompt.content}\n\nYêu cầu bổ sung: ${regenPrompt}`
           : regenPrompt;
-        const batchKey = `regen_${jobId}_${ts}`;
         await dispatchSingleToVps(vpsNode, {
           jobId,
           cookieDir: account.cookie_dir,
@@ -1321,6 +1334,8 @@ async function regenerateJob(jobId, regenPrompt) {
       return { dispatched: true };
     } catch (err) {
       updateJob(jobId, { status: "error", error: `Regen dispatch failed: ${err.message}` });
+      // Release account on dispatch failure
+      releaseBatchAfterVps(batchKey);
       throw err;
     }
   } else {

@@ -495,7 +495,7 @@ app.post("/agent/execute-regen", auth, upload.single("image"), async (req, res) 
     return res.status(503).json({ error: "Agent busy", active: activeWorkers, max: MAX_CONCURRENT });
   }
 
-  const { job_id, cookie_dir, output_prefix, image_style, skip_image_tool, callback_url, regen_conv_url, regen_prompt } = req.body;
+  const { job_id, cookie_dir, output_prefix, image_style, skip_image_tool, callback_url, regen_conv_url, regen_prompt, batch_key } = req.body;
 
   if (!req.file) {
     return res.status(400).json({ error: "image file required" });
@@ -523,12 +523,12 @@ app.post("/agent/execute-regen", auth, upload.single("image"), async (req, res) 
   executeRegenJob({
     job_id, cookiePath, imagePath, output_prefix,
     image_style, skip_image_tool, callback_url,
-    regen_conv_url, regen_prompt,
+    regen_conv_url, regen_prompt, batch_key,
   });
 });
 
 async function executeRegenJob(params) {
-  const { job_id, cookiePath, imagePath, output_prefix, image_style, skip_image_tool, callback_url, regen_conv_url, regen_prompt } = params;
+  const { job_id, cookiePath, imagePath, output_prefix, image_style, skip_image_tool, callback_url, regen_conv_url, regen_prompt, batch_key } = params;
   try {
     const outputFile = await spawnRegenWorker({
       cookieDir: cookiePath,
@@ -551,6 +551,7 @@ async function executeRegenJob(params) {
     await sendCallback(callback_url, {
       type: "done",
       job_id: parseInt(job_id),
+      batch_key,
       output_file: outputFile,
       image_base64: imageBase64,
     });
@@ -559,6 +560,7 @@ async function executeRegenJob(params) {
     await sendCallback(callback_url, {
       type: err.rateLimited ? "rate_limited" : "error",
       job_id: parseInt(job_id),
+      batch_key,
       error: err.message,
     }).catch(e => log(`[Regen ${job_id}] Callback failed: ${e.message}`));
   } finally {
