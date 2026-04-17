@@ -1244,7 +1244,6 @@ async function regenerateJob(jobId, regenPrompt) {
   const job = db.prepare("SELECT * FROM jobs WHERE id = ?").get(jobId);
   if (!job) throw new Error("Job not found");
   if (job.status !== "done") throw new Error("Only completed jobs can be regenerated");
-  if (!job.conversation_url) throw new Error("No conversation URL saved for this job");
 
   // Find the account that was used for this job
   const account = db.prepare("SELECT * FROM gemini_accounts WHERE id = ?").get(job.account_id);
@@ -1287,18 +1286,38 @@ async function regenerateJob(jobId, regenPrompt) {
         throw new Error(`Cookie sync failed for ${path.basename(account.cookie_dir)}`);
       }
 
-      await dispatchRegenToVps(vpsNode, {
-        jobId,
-        cookieDir: account.cookie_dir,
-        imagePath: path.resolve(__dirname, "../../../uploads", job.original_image),
-        outputPrefix,
-        imageStyle,
-        skipImageTool: isLineDrawing,
-        regenConvUrl: job.conversation_url,
-        regenPrompt: fullRegenPrompt,
-      });
+      if (job.conversation_url) {
+        // Has conversation URL → use regen endpoint (continue existing conversation)
+        await dispatchRegenToVps(vpsNode, {
+          jobId,
+          cookieDir: account.cookie_dir,
+          imagePath: path.resolve(__dirname, "../../../uploads", job.original_image),
+          outputPrefix,
+          imageStyle,
+          skipImageTool: isLineDrawing || isTrade,
+          regenConvUrl: job.conversation_url,
+          regenPrompt: fullRegenPrompt,
+        });
+        console.log(`[Regen] Job ${jobId} dispatched to VPS ${vpsNode.name} (conversation regen)`);
+      } else {
+        // No conversation URL → dispatch as fresh single job with modified prompt
+        const freshPrompt = prompt
+          ? `${prompt.content}\n\nYêu cầu bổ sung: ${regenPrompt}`
+          : regenPrompt;
+        const batchKey = `regen_${jobId}_${ts}`;
+        await dispatchSingleToVps(vpsNode, {
+          jobId,
+          cookieDir: account.cookie_dir,
+          imagePath: path.resolve(__dirname, "../../../uploads", job.original_image),
+          promptText: freshPrompt,
+          outputPrefix,
+          imageStyle,
+          skipImageTool: isLineDrawing || isTrade,
+          batchKey,
+        });
+        console.log(`[Regen] Job ${jobId} dispatched to VPS ${vpsNode.name} (fresh conversation)`);
+      }
 
-      console.log(`[Regen] Job ${jobId} dispatched to VPS ${vpsNode.name}`);
       return { dispatched: true };
     } catch (err) {
       updateJob(jobId, { status: "error", error: `Regen dispatch failed: ${err.message}` });

@@ -408,10 +408,6 @@ router.post("/:id/regenerate", authMiddleware, async (req, res) => {
     return res.status(400).json({ error: "Only completed jobs can be regenerated" });
   }
 
-  if (!job.conversation_url) {
-    return res.status(400).json({ error: "No conversation URL — cannot regenerate" });
-  }
-
   try {
     await regenerateJob(jobId, prompt.trim());
     res.json({ ok: true, message: "Regeneration started" });

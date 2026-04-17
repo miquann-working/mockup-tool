@@ -820,7 +820,7 @@ function BatchCard({
               </div>
             )}
           </div>
-          {onRegen && job.status === "done" && job.conversation_url && (
+          {onRegen && job.status === "done" && (
             <div className="mt-2 flex gap-1">
               <input
                 type="text"
@@ -1048,7 +1048,7 @@ function BatchJobItem({ job, onRetry, onRegen, onImageClick, onPromote }: { job:
         </div>
       )}
       {/* Regen UI */}
-      {job.status === "done" && job.conversation_url && onRegen && (
+      {job.status === "done" && onRegen && (
         <div className="mt-2">
           <div className="flex gap-1">
             <input
@@ -1189,7 +1189,7 @@ function BatchJobItemWide({ job, onRetry, onRegen, onImageClick, onPromote }: { 
         )}
       </div>
       {/* Regen UI */}
-      {job.status === "done" && job.conversation_url && onRegen && (
+      {job.status === "done" && onRegen && (
         <div className="flex items-center gap-2 shrink-0">
           <input
             type="text"
