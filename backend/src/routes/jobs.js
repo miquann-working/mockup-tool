@@ -1,10 +1,28 @@
 const { Router } = require("express");
 const multer = require("multer");
 const path = require("path");
+const fs = require("fs");
 const { v4: uuidv4 } = require("uuid");
 const db = require("../db");
 const { authMiddleware, adminOnly } = require("../middleware/auth");
 const { enqueueJob, regenerateJob } = require("../services/jobRunner");
+
+const OUTPUTS_DIR = path.resolve(__dirname, "../../../outputs");
+
+/**
+ * Rename an output file to a unique versioned name so it won't be overwritten
+ * by subsequent retries. Returns the new filename.
+ */
+function preserveOutputFile(filename) {
+  if (!filename) return filename;
+  const srcPath = path.join(OUTPUTS_DIR, filename);
+  if (!fs.existsSync(srcPath)) return filename;
+  const ext = path.extname(filename);
+  const base = path.basename(filename, ext);
+  const newName = `${base}_v${Date.now()}${ext}`;
+  fs.renameSync(srcPath, path.join(OUTPUTS_DIR, newName));
+  return newName;
+}
 
 const router = Router();
 
@@ -281,11 +299,12 @@ router.post("/:id/retry", authMiddleware, (req, res) => {
       .prepare("SELECT id, mockup_image, previous_images, updated_at FROM jobs WHERE batch_id = ? AND status = 'error' ORDER BY id ASC")
       .all(job.batch_id);
     for (const ej of batchErrorJobs) {
-      // Save existing image to previous_images before retrying
+      // Save existing image to previous_images before retrying (rename to preserve)
       if (ej.mockup_image) {
         const prev = ej.previous_images ? JSON.parse(ej.previous_images) : [];
-        prev.push({ image: ej.mockup_image, at: ej.updated_at || new Date().toISOString() });
-        db.prepare("UPDATE jobs SET previous_images = ? WHERE id = ?").run(JSON.stringify(prev), ej.id);
+        const preserved = preserveOutputFile(ej.mockup_image);
+        prev.push({ image: preserved, at: ej.updated_at || new Date().toISOString() });
+        db.prepare("UPDATE jobs SET previous_images = ?, mockup_image = NULL WHERE id = ?").run(JSON.stringify(prev), ej.id);
       }
       db.prepare(
         "UPDATE jobs SET status = 'pending', error = NULL, retry_count = 0, updated_at = datetime('now') WHERE id = ?"
@@ -297,11 +316,12 @@ router.post("/:id/retry", authMiddleware, (req, res) => {
     }
     console.log(`[Retry] Batch ${job.batch_id}: retrying ${batchErrorJobs.length} error jobs together`);
   } else {
-    // Save existing image to previous_images before retrying
+    // Save existing image to previous_images before retrying (rename to preserve)
     if (job.mockup_image) {
       const prev = job.previous_images ? JSON.parse(job.previous_images) : [];
-      prev.push({ image: job.mockup_image, at: job.updated_at || new Date().toISOString() });
-      db.prepare("UPDATE jobs SET previous_images = ? WHERE id = ?").run(JSON.stringify(prev), job.id);
+      const preserved = preserveOutputFile(job.mockup_image);
+      prev.push({ image: preserved, at: job.updated_at || new Date().toISOString() });
+      db.prepare("UPDATE jobs SET previous_images = ?, mockup_image = NULL WHERE id = ?").run(JSON.stringify(prev), job.id);
     }
     db.prepare(
       "UPDATE jobs SET status = 'pending', error = NULL, retry_count = 0, updated_at = datetime('now') WHERE id = ?"

@@ -27,6 +27,21 @@ const regenParams = new Map();
 
 // ── Helpers ─────────────────────────────────────────────────
 
+/**
+ * Rename an output file to a unique versioned name so it won't be overwritten
+ * by subsequent retries/regens. Returns the new filename.
+ */
+function preserveOutputFile(filename) {
+  if (!filename) return filename;
+  const srcPath = path.join(OUTPUTS_DIR, filename);
+  if (!fs.existsSync(srcPath)) return filename;
+  const ext = path.extname(filename);
+  const base = path.basename(filename, ext);
+  const newName = `${base}_v${Date.now()}${ext}`;
+  fs.renameSync(srcPath, path.join(OUTPUTS_DIR, newName));
+  return newName;
+}
+
 function pickAccount(userId) {
   // Find user's VPS assignment
   let vpsId = null;
@@ -1377,10 +1392,11 @@ async function regenerateJob(jobId, regenPrompt) {
   const account = db.prepare("SELECT * FROM gemini_accounts WHERE id = ?").get(job.account_id);
   if (!account) throw new Error("Original account not found");
 
-  // Save current mockup_image to previous_images before regenerating
+  // Save current mockup_image to previous_images before regenerating (rename to preserve)
   if (job.mockup_image) {
     const prev = job.previous_images ? JSON.parse(job.previous_images) : [];
-    prev.push({ image: job.mockup_image, at: job.updated_at || new Date().toISOString() });
+    const preserved = preserveOutputFile(job.mockup_image);
+    prev.push({ image: preserved, at: job.updated_at || new Date().toISOString() });
     updateJob(jobId, { previous_images: JSON.stringify(prev) });
   }
 
