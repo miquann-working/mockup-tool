@@ -114,14 +114,18 @@ router.post("/", authMiddleware, upload.single("image"), (req, res) => {
   }
 
   const batchId = promptIds.length > 1 ? uuidv4() : null;
+  const getPrompt = db.prepare(
+    "SELECT p.*, pg.role as group_role, pg.image_style FROM prompts p LEFT JOIN prompt_groups pg ON p.group_id = pg.id WHERE p.id = ?"
+  );
   const insertJob = db.prepare(
-    "INSERT INTO jobs (batch_id, user_id, prompt_id, original_image) VALUES (?, ?, ?, ?)"
+    "INSERT INTO jobs (batch_id, user_id, prompt_id, original_image, prompt_name, prompt_content, prompt_mode, prompt_group_role, prompt_image_style) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
   );
 
   const createdJobs = db.transaction(() => {
     const results = [];
     for (const pid of promptIds) {
-      const info = insertJob.run(batchId, req.user.id, pid, req.file.filename);
+      const p = getPrompt.get(pid);
+      const info = insertJob.run(batchId, req.user.id, pid, req.file.filename, p.name, p.content, p.mode || 'mockup', p.group_role || 'mockup', p.image_style || '');
       const job = db.prepare("SELECT * FROM jobs WHERE id = ?").get(info.lastInsertRowid);
       results.push(job);
     }
@@ -190,8 +194,8 @@ router.get("/", authMiddleware, (req, res) => {
   let jobs = [];
   if (batchKeys.length > 0) {
     const baseSelect = req.user.role === "admin"
-      ? "SELECT jobs.*, users.username, prompts.name as prompt_name, prompts.mode as prompt_mode, prompt_groups.role as group_role FROM jobs LEFT JOIN users ON jobs.user_id = users.id LEFT JOIN prompts ON jobs.prompt_id = prompts.id LEFT JOIN prompt_groups ON prompts.group_id = prompt_groups.id"
-      : "SELECT jobs.*, prompts.name as prompt_name, prompts.mode as prompt_mode, prompt_groups.role as group_role FROM jobs LEFT JOIN prompts ON jobs.prompt_id = prompts.id LEFT JOIN prompt_groups ON prompts.group_id = prompt_groups.id";
+      ? "SELECT jobs.*, users.username, COALESCE(prompts.name, jobs.prompt_name) as prompt_name, COALESCE(prompts.mode, jobs.prompt_mode) as prompt_mode, COALESCE(prompt_groups.role, jobs.prompt_group_role) as group_role FROM jobs LEFT JOIN users ON jobs.user_id = users.id LEFT JOIN prompts ON jobs.prompt_id = prompts.id LEFT JOIN prompt_groups ON prompts.group_id = prompt_groups.id"
+      : "SELECT jobs.*, COALESCE(prompts.name, jobs.prompt_name) as prompt_name, COALESCE(prompts.mode, jobs.prompt_mode) as prompt_mode, COALESCE(prompt_groups.role, jobs.prompt_group_role) as group_role FROM jobs LEFT JOIN prompts ON jobs.prompt_id = prompts.id LEFT JOIN prompt_groups ON prompts.group_id = prompt_groups.id";
 
     const placeholders = batchKeys.map(() => "?").join(",");
     const batchWhere = where
@@ -480,8 +484,11 @@ router.post("/multi", authMiddleware, upload.array("images", 20), (req, res) => 
   if (prompts.length === 0) return res.status(400).json({ error: "Group has no prompts" });
 
   const promptIds = prompts.map((p) => p.id);
+  const getPromptFull = db.prepare(
+    "SELECT p.*, pg.role as group_role, pg.image_style FROM prompts p LEFT JOIN prompt_groups pg ON p.group_id = pg.id WHERE p.id = ?"
+  );
   const insertJob = db.prepare(
-    "INSERT INTO jobs (batch_id, user_id, prompt_id, original_image) VALUES (?, ?, ?, ?)"
+    "INSERT INTO jobs (batch_id, user_id, prompt_id, original_image, prompt_name, prompt_content, prompt_mode, prompt_group_role, prompt_image_style) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
   );
 
   const allJobs = db.transaction(() => {
@@ -489,7 +496,8 @@ router.post("/multi", authMiddleware, upload.array("images", 20), (req, res) => 
     for (const file of req.files) {
       const batchId = promptIds.length > 1 ? uuidv4() : null;
       for (const pid of promptIds) {
-        const info = insertJob.run(batchId, req.user.id, pid, file.filename);
+        const p = getPromptFull.get(pid);
+        const info = insertJob.run(batchId, req.user.id, pid, file.filename, p.name, p.content, p.mode || 'mockup', p.group_role || 'mockup', p.image_style || '');
         const job = db.prepare("SELECT * FROM jobs WHERE id = ?").get(info.lastInsertRowid);
         results.push(job);
       }

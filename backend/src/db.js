@@ -201,6 +201,44 @@ try {
   // column already exists – ignore
 }
 
+// ── Migration: add prompt snapshot columns to jobs ─────
+try {
+  db.exec(`ALTER TABLE jobs ADD COLUMN prompt_name TEXT`);
+} catch (e) { /* already exists */ }
+try {
+  db.exec(`ALTER TABLE jobs ADD COLUMN prompt_content TEXT`);
+} catch (e) { /* already exists */ }
+try {
+  db.exec(`ALTER TABLE jobs ADD COLUMN prompt_mode TEXT DEFAULT 'mockup'`);
+} catch (e) { /* already exists */ }
+try {
+  db.exec(`ALTER TABLE jobs ADD COLUMN prompt_group_role TEXT DEFAULT 'mockup'`);
+} catch (e) { /* already exists */ }
+try {
+  db.exec(`ALTER TABLE jobs ADD COLUMN prompt_image_style TEXT DEFAULT ''`);
+} catch (e) { /* already exists */ }
+
+// ── Migration: backfill prompt snapshots for existing jobs ─────
+try {
+  const needsBackfill = db.prepare(
+    "SELECT COUNT(*) as cnt FROM jobs WHERE prompt_id IS NOT NULL AND prompt_content IS NULL"
+  ).get();
+  if (needsBackfill.cnt > 0) {
+    db.exec(`
+      UPDATE jobs SET
+        prompt_name = (SELECT p.name FROM prompts p WHERE p.id = jobs.prompt_id),
+        prompt_content = (SELECT p.content FROM prompts p WHERE p.id = jobs.prompt_id),
+        prompt_mode = (SELECT COALESCE(p.mode, 'mockup') FROM prompts p WHERE p.id = jobs.prompt_id),
+        prompt_group_role = (SELECT COALESCE(pg.role, 'mockup') FROM prompts p LEFT JOIN prompt_groups pg ON p.group_id = pg.id WHERE p.id = jobs.prompt_id),
+        prompt_image_style = (SELECT COALESCE(pg.image_style, '') FROM prompts p LEFT JOIN prompt_groups pg ON p.group_id = pg.id WHERE p.id = jobs.prompt_id)
+      WHERE prompt_id IS NOT NULL AND prompt_content IS NULL
+    `);
+    console.log(`[DB Migration] Backfilled prompt snapshots for ${needsBackfill.cnt} jobs`);
+  }
+} catch (e) {
+  console.error('[DB Migration] Backfill error:', e.message);
+}
+
 // ── Migration: make prompt_id nullable in jobs (allow prompt deletion) ─────
 try {
   const jobsSql = db.prepare(
@@ -226,16 +264,23 @@ try {
           updated_at TEXT DEFAULT (datetime('now')),
           retry_count INTEGER NOT NULL DEFAULT 0,
           conversation_url TEXT,
-          previous_images TEXT
+          previous_images TEXT,
+          prompt_name TEXT,
+          prompt_content TEXT,
+          prompt_mode TEXT DEFAULT 'mockup',
+          prompt_group_role TEXT DEFAULT 'mockup',
+          prompt_image_style TEXT DEFAULT ''
         )
       `);
       db.exec(`
         INSERT INTO jobs_new (id, batch_id, user_id, prompt_id, account_id, original_image,
           mockup_image, line_image, status, error, created_at, updated_at,
-          retry_count, conversation_url, previous_images)
+          retry_count, conversation_url, previous_images,
+          prompt_name, prompt_content, prompt_mode, prompt_group_role, prompt_image_style)
         SELECT id, batch_id, user_id, prompt_id, account_id, original_image,
           mockup_image, line_image, status, error, created_at, updated_at,
-          retry_count, conversation_url, previous_images
+          retry_count, conversation_url, previous_images,
+          prompt_name, prompt_content, prompt_mode, prompt_group_role, prompt_image_style
         FROM jobs
       `);
       db.exec(`DROP TABLE jobs`);

@@ -562,7 +562,13 @@ async function processBatchJobs(jobIds, accountId, batchKey) {
     const job = db.prepare("SELECT * FROM jobs WHERE id = ?").get(jobId);
     if (!job) continue;
 
-    const prompt = db.prepare("SELECT * FROM prompts WHERE id = ?").get(job.prompt_id);
+    // Use snapshot from job first, fallback to DB prompt
+    let prompt;
+    if (job.prompt_content) {
+      prompt = { name: job.prompt_name, content: job.prompt_content, mode: job.prompt_mode || 'mockup', group_id: null };
+    } else {
+      prompt = db.prepare("SELECT * FROM prompts WHERE id = ?").get(job.prompt_id);
+    }
     if (!prompt) {
       console.error(`[Batch ${batchKey}] Job ${jobId}: Prompt #${job.prompt_id} not found (deleted?)`);
       updateJob(jobId, { status: "error", error: `Prompt #${job.prompt_id} not found (deleted?)` });
@@ -587,12 +593,12 @@ async function processBatchJobs(jobIds, accountId, batchKey) {
     return;
   }
 
-  // Get shared config from first job
+  // Get shared config from first job (prefer snapshot)
+  const firstJob = jobDataList[0].job;
   const firstPrompt = jobDataList[0].prompt;
-  const promptGroup = db.prepare("SELECT * FROM prompt_groups WHERE id = ?").get(firstPrompt.group_id);
-  const imageStyle = promptGroup?.image_style || "";
-  const isLineDrawing = firstPrompt.mode === "line_drawing";
-  const isTrade = promptGroup?.role === "trade";
+  const imageStyle = firstJob.prompt_image_style || (firstPrompt.group_id ? (db.prepare("SELECT image_style FROM prompt_groups WHERE id = ?").get(firstPrompt.group_id)?.image_style || "") : "");
+  const isLineDrawing = (firstJob.prompt_mode || firstPrompt.mode) === "line_drawing";
+  const isTrade = (firstJob.prompt_group_role || "mockup") === "trade" || (firstPrompt.group_id ? (db.prepare("SELECT role FROM prompt_groups WHERE id = ?").get(firstPrompt.group_id)?.role === "trade") : false);
 
   // Build JOBS_JSON
   const jobsJson = jobDataList.map(({ job, prompt }) => ({
@@ -921,16 +927,21 @@ async function processJob(jobId, accountId, batchKeyOverride) {
     }
   }
 
-  const prompt = db.prepare("SELECT * FROM prompts WHERE id = ?").get(job.prompt_id);
+  // Use snapshot from job first, fallback to DB prompt
+  let prompt;
+  if (job.prompt_content) {
+    prompt = { name: job.prompt_name, content: job.prompt_content, mode: job.prompt_mode || 'mockup', group_id: null };
+  } else {
+    prompt = db.prepare("SELECT * FROM prompts WHERE id = ?").get(job.prompt_id);
+  }
   if (!prompt) {
     console.error(`[Job ${jobId}] Prompt #${job.prompt_id} not found (deleted?)`);
     updateJob(jobId, { status: "error", error: `Prompt #${job.prompt_id} not found (deleted?)` });
     return;
   }
-  const promptGroup = db.prepare("SELECT * FROM prompt_groups WHERE id = ?").get(prompt.group_id);
-  const imageStyle = promptGroup?.image_style || "";
-  const isLineDrawing = prompt?.mode === "line_drawing";
-  const isTrade = promptGroup?.role === "trade";
+  const imageStyle = job.prompt_image_style || (prompt.group_id ? (db.prepare("SELECT image_style FROM prompt_groups WHERE id = ?").get(prompt.group_id)?.image_style || "") : "");
+  const isLineDrawing = (job.prompt_mode || prompt.mode) === "line_drawing";
+  const isTrade = (job.prompt_group_role || "mockup") === "trade" || (prompt.group_id ? (db.prepare("SELECT role FROM prompt_groups WHERE id = ?").get(prompt.group_id)?.role === "trade") : false);
   const outputPrefix = isLineDrawing ? `line_${jobId}` : isTrade ? `trade_${jobId}` : `mockup_${jobId}`;
 
   // ── VPS dispatch ──────────────────────────────────────────
@@ -1403,20 +1414,27 @@ async function regenerateJob(jobId, regenPrompt) {
   // Mark job as pending for regen, clear mockup_image so UI shows placeholder
   updateJob(jobId, { status: "pending", error: null, mockup_image: null });
 
-  const prompt = db.prepare("SELECT * FROM prompts WHERE id = ?").get(job.prompt_id);
-  const isLineDrawing = prompt?.mode === "line_drawing";
-  const promptGroup = prompt?.group_id ? db.prepare("SELECT * FROM prompt_groups WHERE id = ?").get(prompt.group_id) : null;
-  const imageStyle = promptGroup?.image_style || "";
-  const isTrade = promptGroup?.role === "trade";
+  // Use snapshot from job first, fallback to DB prompt
+  let prompt;
+  if (job.prompt_content) {
+    prompt = { name: job.prompt_name, content: job.prompt_content, mode: job.prompt_mode || 'mockup', group_id: null };
+  } else {
+    prompt = db.prepare("SELECT * FROM prompts WHERE id = ?").get(job.prompt_id);
+  }
+  const isLineDrawing = (job.prompt_mode || prompt?.mode) === "line_drawing";
+  const imageStyle = job.prompt_image_style || (prompt?.group_id ? (db.prepare("SELECT image_style FROM prompt_groups WHERE id = ?").get(prompt.group_id)?.image_style || "") : "");
+  const isTrade = (job.prompt_group_role || "mockup") === "trade" || (prompt?.group_id ? (db.prepare("SELECT role FROM prompt_groups WHERE id = ?").get(prompt.group_id)?.role === "trade") : false);
   const ts = Date.now();
   const outputPrefix = isLineDrawing ? `line_${job.id}_regen_${ts}` : isTrade ? `trade_${job.id}_regen_${ts}` : `mockup_${job.id}_regen_${ts}`;
 
   // Build the regen prompt text
-  const fullRegenPrompt = prompt
-    ? `Hãy tạo lại ảnh cho góc "${prompt.name}" với yêu cầu bổ sung sau: ${regenPrompt}`
+  const promptName = job.prompt_name || prompt?.name;
+  const promptContent = job.prompt_content || prompt?.content;
+  const fullRegenPrompt = promptName
+    ? `Hãy tạo lại ảnh cho góc "${promptName}" với yêu cầu bổ sung sau: ${regenPrompt}`
     : regenPrompt;
-  const freshPrompt = prompt
-    ? `${prompt.content}\n\nYêu cầu bổ sung: ${regenPrompt}`
+  const freshPrompt = promptContent
+    ? `${promptContent}\n\nYêu cầu bổ sung: ${regenPrompt}`
     : regenPrompt;
 
   // Store regen params for processJob to use when this job is dequeued
