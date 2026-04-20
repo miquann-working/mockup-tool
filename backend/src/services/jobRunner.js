@@ -1153,6 +1153,13 @@ function handleVpsSingleError(jobId, batchKey, errMsg) {
     console.warn(`[VPS] Job ${jobId} retry ${next}/${MAX_RETRIES} in ${delaySec}s`);
     updateJob(jobId, { status: "pending", error: errMsg, retry_count: next });
 
+    // Release account so it can be reused after cooldown
+    const batch = batches.get(batchKey);
+    if (batch && batch.accountId) {
+      scheduleCooldown(batch.accountId);
+      batch.accountId = null;
+    }
+
     pendingRetries.set(batchKey, (pendingRetries.get(batchKey) || 0) + 1);
     setTimeout(() => {
       pendingRetries.set(batchKey, (pendingRetries.get(batchKey) || 1) - 1);
@@ -1391,6 +1398,46 @@ function resetStuckAccounts() {
   }
 }
 resetStuckAccounts();
+
+// ── Periodic stuck account recovery (every 5 minutes) ───────
+const STUCK_CHECK_INTERVAL_MS = 5 * 60 * 1000;
+setInterval(() => {
+  // Find accounts that are busy but have no in-memory batch using them
+  const busyAccounts = db
+    .prepare("SELECT id, email FROM gemini_accounts WHERE status = 'busy'")
+    .all();
+  for (const acc of busyAccounts) {
+    // Check if any batch in memory is actually using this account
+    let inUse = false;
+    for (const [, batch] of batches) {
+      if (batch.accountId === acc.id && batch.processing) {
+        inUse = true;
+        break;
+      }
+    }
+    if (!inUse) {
+      console.warn(`[StuckRecovery] Account #${acc.id} (${acc.email}) is busy but no active batch — releasing to free`);
+      setAccountStatus(acc.id, "free");
+    }
+  }
+
+  // Re-queue any pending jobs that have no batch in memory
+  const pendingJobs = db
+    .prepare("SELECT id, batch_id FROM jobs WHERE status = 'pending' ORDER BY id ASC")
+    .all();
+  let requeued = 0;
+  for (const j of pendingJobs) {
+    const batchKey = j.batch_id || `single_${j.id}`;
+    const batch = batches.get(batchKey);
+    if (!batch || (!batch.processing && !batch.jobs.includes(j.id))) {
+      enqueueJob(j.id);
+      requeued++;
+    }
+  }
+  if (requeued > 0) {
+    console.log(`[StuckRecovery] Re-queued ${requeued} orphaned pending job(s)`);
+  }
+}, STUCK_CHECK_INTERVAL_MS);
 
 // ── Regeneration ────────────────────────────────────────────
 
