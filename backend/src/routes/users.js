@@ -97,7 +97,7 @@ router.delete("/:id", authMiddleware, adminOnly, (req, res) => {
   const del = db.transaction(() => {
     db.prepare("UPDATE jobs SET user_id = 1 WHERE user_id = ?").run(id);
     db.prepare("UPDATE prompt_groups SET user_id = NULL WHERE user_id = ?").run(id);
-    db.prepare("UPDATE gemini_accounts SET user_id = NULL WHERE user_id = ?").run(id);
+    db.prepare("UPDATE gemini_accounts SET user_id = 1 WHERE user_id = ?").run(id);
     db.prepare("DELETE FROM users WHERE id = ?").run(id);
   });
   del();
